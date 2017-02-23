@@ -348,12 +348,14 @@ class TestAnnotationParser(AnnotationTest):
         self.identifier = self.pool.identifier
         self.patron = self._patron()
         
-    def _sample_jsonld(self):
+    def _sample_jsonld(self, motivation=Annotation.IDLING):
         data = dict()
         data["@context"] = [AnnotationWriter.JSONLD_CONTEXT, 
                             {'ls': Annotation.LS_NAMESPACE}]
         data["type"] = "Annotation"
-        data["motivation"] = Annotation.IDLING.replace(Annotation.LS_NAMESPACE, 'ls:')
+        motivation = motivation.replace(Annotation.LS_NAMESPACE, 'ls:')
+        motivation = motivation.replace(Annotation.OA_NAMESPACE, 'oa:')
+        data["motivation"] = motivation
         data["body"] = {
             "type": "TextualBody",
             "bodyValue": "A good description of the topic that bears further investigation",
@@ -463,11 +465,34 @@ class TestAnnotationParser(AnnotationTest):
         eq_(json.dumps(expanded["http://www.w3.org/ns/oa#hasTarget"][0]), annotation.target)
         eq_(json.dumps(expanded["http://www.w3.org/ns/oa#hasBody"][0]), annotation.content)
 
+    def test_parse_jsonld_with_bookmarking_motivation(self):
+        """You can create multiple bookmarks in a single book."""
+        self.pool.loan_to(self.patron)
+
+        data = self._sample_jsonld(motivation=Annotation.BOOKMARKING)
+        data_json = json.dumps(data)
+        annotation = AnnotationParser.parse(self._db, data_json, self.patron)
+        eq_(Annotation.BOOKMARKING, annotation.motivation)
+
+        # You can't create another bookmark at the exact same location --
+        # you just get the same annotation again.
+        annotation2 = AnnotationParser.parse(self._db, data_json, self.patron)
+        eq_(annotation, annotation2)
+
+        # But unlike with IDLING, you _can_ create multiple bookmarks
+        # for the same identifier, so long as the selector value
+        # (ie. the location within the book) is different.
+        data['target']['selector']['value'] = 'epubcfi(/3/4[chap01ref]!/4[body01]/15[para05]/3:10)'
+        data_json = json.dumps(data)
+        annotation3 = AnnotationParser.parse(self._db, data_json, self.patron)
+        assert annotation3 != annotation
+        eq_(2, len(self.patron.annotations))
+        
     def test_parse_jsonld_with_invalid_motivation(self):
         self.pool.loan_to(self.patron)
 
         data = self._sample_jsonld()
-        data["motivation"] = "bookmarking"
+        data["motivation"] = "not-a-valid-motivation"
         data_json = json.dumps(data)
 
         annotation = AnnotationParser.parse(self._db, data_json, self.patron)
