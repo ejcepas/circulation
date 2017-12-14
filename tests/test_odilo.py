@@ -1,28 +1,21 @@
 # encoding: utf-8
-import os
 import json
-import unittest
 
-from flask import (
-    Flask,
+from nose.tools import (
+    eq_, ok_, assert_raises,
 )
 
 from api.odilo import (
-    OdiloAPI,
     MockOdiloAPI,
-    OdiloCirculationMonitor,
-    FullOdiloCollectionMonitor,
     RecentOdiloCollectionMonitor,
+    FullOdiloCollectionMonitor
 )
 
 from api.circulation import (
     CirculationAPI,
-    CirculationException
 )
 
-from sqlalchemy.ext.declarative import declarative_base
-from flask_sqlalchemy_session import flask_scoped_session
-from api.config import Configuration
+from api.circulation_exceptions import *
 
 from . import (
     DatabaseTest,
@@ -30,76 +23,35 @@ from . import (
 )
 
 from core.model import (
-    Collection,
-    ConfigurationSetting,
     DataSource,
-    DeliveryMechanism,
     ExternalIntegration,
     Identifier,
-    Library,
-    LicensePool,
     Representation,
-    RightsStatus,
-    SessionManager
+    DeliveryMechanism
 )
 
-Base = declarative_base()
-app = Flask(__name__)
 
-testing = True
-# testing = 'TESTING' in os.environ
-db_url = Configuration.database_url(testing)
-# Initialize a new database session unless we were told not to
-# (e.g. because a script already initialized it).
-autoinitialize = os.environ.get('AUTOINITIALIZE') != 'False'
-if autoinitialize:
-    SessionManager.initialize(db_url)
-session_factory = SessionManager.sessionmaker(db_url)
-_db = flask_scoped_session(session_factory, app)
-if autoinitialize:
-    SessionManager.initialize_data(_db)
+class OdiloAPITest(DatabaseTest):
+    PATRON = '0001000265'
+    PIN = 'c4ca4238a0b923820dcc509a6f75849b'
+    RECORD_ID = '00010982'
 
-
-class OdiloAPITest(DatabaseTest, unittest.TestCase):
     def setup(self):
         super(OdiloAPITest, self).setup()
         library = self._default_library
-        self._db = _db
         self.collection = MockOdiloAPI.mock_collection(self._db)
-        self.circulation = CirculationAPI(self._db, library, api_map={ExternalIntegration.ODILO: MockOdiloAPI})
+        self.circulation = CirculationAPI(
+            self._db, library, api_map={ExternalIntegration.ODILO: MockOdiloAPI}
+        )
         self.api = self.circulation.api_for_collection[self.collection.id]
 
-    def setUp(self):
-        self.setUp_common()
-        self._db = _db
-
-        # Load from DB or fake collection
-        self.collection = None
-        self.fake_collection()
-        self.api = OdiloAPI(self._db, self.collection)
-
-    def fake_collection(self):
-        collection = Collection
-        collection.protocol = ExternalIntegration.ODILO
-        collection.id = 1
-
-        collection.external_integration = ExternalIntegration
-        collection.external_integration.username = 'Odilo'
-        collection.external_integration.password = 'secret'
-
-        # external_integration = collection.create_external_integration(ExternalIntegration.ODILO, self._db)
-
-        collection.external_integration.settings.info = {
-            OdiloAPI.LIBRARY_API_BASE_URL: 'http://localhost:8080/api/v2',
-            'username': 'Odilo',
-            'password': 'secret'
-        }
-
-        self.collection = collection
-
-    @classmethod
-    def setUp_common(cls):
-        print 'setUp common'
+        self.edition, self.licensepool = self._edition(
+            data_source_name=DataSource.ODILO,
+            identifier_type=Identifier.ODILO_ID,
+            collection=self.collection,
+            identifier_id=self.RECORD_ID,
+            with_license_pool=True
+        )
 
     @classmethod
     def sample_data(cls, filename):
@@ -120,131 +72,260 @@ class OdiloAPITest(DatabaseTest, unittest.TestCase):
         return json.dumps(data)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-patron = '001000265'
-pin = 'c4ca4238a0b923820dcc509a6f75849b'
-record_id = '00010982'
-# internal_format = 'EPUB'
-internal_format = 'ACSM'
-checkout_id = ''
-hold_id = ''
-
-licensepool = LicensePool
-# licensepool.collection = 'Odilo Test Collection'
-# licensepool.collection.id = 1
-licensepool.data_source.name = DataSource.ODILO
-licensepool.identifier.type = Identifier.ODILO_ID,
-licensepool.identifier.identifier = record_id  # Record_id
-
-
-# licensepool.identifier.identifier = '00010953'  # Record_id 2
-# licensepool.identifier.identifier = '00011052'  # Record_id 2
-# licensepool.identifier.identifier = '0001098345342'  # fake Record_id
-
-
 class TestOdiloCirculationAPI(OdiloAPITest):
-    def test_1_checkout(self):
-        print('Checkout test')
-        licensepool.collection = self.collection
+    #################
+    # General tests
+    #################
 
-        loan_info = self.api.checkout(patron, pin, licensepool, internal_format)
-        self.assertIsNotNone(loan_info, msg="LoanInfo null --> checkout failed!")
-        print 'Loan ok: %s' % loan_info.identifier
+    # Test 404 Not Found --> patron not found --> 'patronNotFound'
+    def test_01_patron_not_found(self):
+        patron_not_found_data, patron_not_found_json = self.sample_json("error_patron_not_found.json")
+        self.api.queue_response(404, content=patron_not_found_json)
 
-        global checkout_id
-        checkout_id = loan_info.identifier  # Checkout id
+        assert_raises(PatronNotFoundOnRemote, self.api.checkout, '123456789', self.PIN, self.licensepool, 'ACSM_EPUB')
+        self.api.log.info('Test patron not found ok!')
 
-    def test_2_fulfill(self):
-        print('Fulfill test')
+    # Test 404 Not Found --> record not found --> 'ERROR_DATA_NOT_FOUND'
+    def test_02_data_not_found(self):
+        data_not_found_data, data_not_found_json = self.sample_json("error_data_not_found.json")
+        self.api.queue_response(404, content=data_not_found_json)
 
-        licensepool.collection = self.collection
-        licensepool.identifier.identifier = checkout_id
+        self.licensepool.identifier.identifier = '12345678'
+        assert_raises(NotFoundOnRemote, self.api.checkout, self.PATRON, self.PIN, self.licensepool, 'ACSM_EPUB')
+        self.api.log.info('Test resource not found on remote ok!')
 
-        fulfillment_info = self.api.fulfill(patron, pin, licensepool, internal_format)
-        self.assertIsNotNone(fulfillment_info, msg='Cannot Fulfill !!')
+    #################
+    # Checkout tests
+    #################
+
+    # Test 400 Bad Request --> Invalid format for that resource
+    def test_11_checkout_fake_format(self):
+        self.api.queue_response(400, content="")
+        assert_raises(NoAcceptableFormat, self.api.checkout, self.PATRON, self.PIN, self.licensepool, 'FAKE_FORMAT')
+        self.api.log.info('Test invalid format for resource ok!')
+
+    def test_12_checkout_acsm_epub(self):
+        checkout_data, checkout_json = self.sample_json("checkout_acsm_epub_ok.json")
+        self.api.queue_response(200, content=checkout_json)
+        self.perform_and_validate_checkout('ACSM_EPUB')
+
+    def test_13_checkout_acsm_pdf(self):
+        checkout_data, checkout_json = self.sample_json("checkout_acsm_pdf_ok.json")
+        self.api.queue_response(200, content=checkout_json)
+        self.perform_and_validate_checkout('ACSM_PDF')
+
+    def test_14_checkout_ebook_streaming(self):
+        checkout_data, checkout_json = self.sample_json("checkout_ebook_streaming_ok.json")
+        self.api.queue_response(200, content=checkout_json)
+        self.perform_and_validate_checkout('EBOOK_STREAMING')
+
+    def perform_and_validate_checkout(self, internal_format):
+        loan_info = self.api.checkout(self.PATRON, self.PIN, self.licensepool, internal_format)
+        ok_(loan_info, msg="LoanInfo null --> checkout failed!")
+        self.api.log.info('Loan ok: %s' % loan_info.identifier)
+
+    #################
+    # Fulfill tests
+    #################
+
+    def test_21_fulfill_acsm_epub(self):
+        checkout_data, checkout_json = self.sample_json("patron_checkouts.json")
+        self.api.queue_response(200, content=checkout_json)
+
+        acsm_data = self.sample_data("fulfill_ok_acsm_epub.acsm")
+        self.api.queue_response(200, content=acsm_data)
+
+        fulfillment_info = self.fulfill('ACSM_EPUB')
+        eq_(fulfillment_info.content_type[0], Representation.EPUB_MEDIA_TYPE)
+        eq_(fulfillment_info.content_type[1], DeliveryMechanism.ADOBE_DRM)
+
+    def test_22_fulfill_acsm_pdf(self):
+        checkout_data, checkout_json = self.sample_json("patron_checkouts.json")
+        self.api.queue_response(200, content=checkout_json)
+
+        acsm_data = self.sample_data("fulfill_ok_acsm_pdf.acsm")
+        self.api.queue_response(200, content=acsm_data)
+
+        fulfillment_info = self.fulfill('ACSM_PDF')
+        eq_(fulfillment_info.content_type[0], Representation.PDF_MEDIA_TYPE)
+        eq_(fulfillment_info.content_type[1], DeliveryMechanism.ADOBE_DRM)
+
+    def test_23_fulfill_ebook_streaming(self):
+        checkout_data, checkout_json = self.sample_json("patron_checkouts.json")
+        self.api.queue_response(200, content=checkout_json)
+
+        self.licensepool.identifier.identifier = '00011055'
+        fulfillment_info = self.fulfill('EBOOK_STREAMING')
+        eq_(fulfillment_info.content_type[0], Representation.TEXT_HTML_MEDIA_TYPE)
+        eq_(fulfillment_info.content_type[1], DeliveryMechanism.STREAMING_TEXT_CONTENT_TYPE)
+
+    def fulfill(self, internal_format):
+        fulfillment_info = self.api.fulfill(self.PATRON, self.PIN, self.licensepool, internal_format)
+        ok_(fulfillment_info, msg='Cannot Fulfill !!')
 
         if fulfillment_info.content_link:
-            print 'Fulfill link: %s' % fulfillment_info.content_link
+            self.api.log.info('Fulfill link: %s' % fulfillment_info.content_link)
         if fulfillment_info.content:
-            print 'Fulfill content: %s' % fulfillment_info.content
+            self.api.log.info('Fulfill content: %s' % fulfillment_info.content)
 
-    def test_3_place_hold(self):
-        print('Place hold test')
+        return fulfillment_info
 
-        licensepool.collection = self.collection
-        licensepool.identifier.identifier = record_id
-        # licensepool.identifier.identifier = '3942796523745'  # Test Non exists
+    #################
+    # Hold tests
+    #################
 
-        hold_info = self.api.place_hold(patron, pin, licensepool, 'ejcepas@odilotid.es')
-        self.assertIsNotNone(hold_info, msg="HoldInfo null --> place hold failed!")
-        print 'Hold ok: %s' % hold_info.identifier
+    def test_31_already_on_hold(self):
+        already_on_hold_data, already_on_hold_json = self.sample_json("error_hold_already_in_hold.json")
+        self.api.queue_response(403, content=already_on_hold_json)
 
-        global hold_id
-        hold_id = hold_info.identifier
+        assert_raises(AlreadyOnHold, self.api.place_hold, self.PATRON, self.PIN, self.licensepool,
+                      'ejcepas@odilotid.es')
 
-    def test_4_patron_activity(self):
-        print ('Patron activity')
+        self.api.log.info('Test hold already on hold ok!')
 
-        loans_and_holds = self.api.patron_activity(patron, pin)
-        if loans_and_holds:
-            print 'Found: %i loans and holds' % len(loans_and_holds)
-        else:
-            print 'No loans or holds found'
+    def test_32_place_hold(self):
+        hold_ok_data, hold_ok_json = self.sample_json("place_hold_ok.json")
+        self.api.queue_response(200, content=hold_ok_json)
 
-    def test_5_checkin(self):
-        print('Checkin test')
+        hold_info = self.api.place_hold(self.PATRON, self.PIN, self.licensepool, 'ejcepas@odilotid.es')
+        ok_(hold_info, msg="HoldInfo null --> place hold failed!")
+        self.api.log.info('Hold ok: %s' % hold_info.identifier)
 
-        licensepool.identifier.identifier = checkout_id
-        licensepool.collection = self.collection
-        # licensepool.identifier.identifier = '4218888'  # Fake Checkout id
+    #################
+    # Patron Activity tests
+    #################
 
-        try:
-            response = self.api.checkin(patron, pin, licensepool)
-            self.assertEqual(response.status_code, 200, msg="Response code != 200, cannot perform checkin for record: "
-                                                            + licensepool.identifier.identifier + " patron: " + patron)
-            checkout_returned = response.json()
-            print 'Checkout returned: %s' % checkout_returned['id']
-        except CirculationException as e:
-            print 'CirculationException happend: ' + e.message
+    def test_41_patron_activity_invalid_patron(self):
+        patron_not_found_data, patron_not_found_json = self.sample_json("error_patron_not_found.json")
+        self.api.queue_response(404, content=patron_not_found_json)
 
-    def test_6_return_hold(self):
-        print('Return hold test')
+        assert_raises(PatronNotFoundOnRemote, self.api.patron_activity, self.PATRON, self.PIN)
 
-        licensepool.identifier.identifier = hold_id
-        licensepool.collection = self.collection
-        # licensepool.identifier.identifier = '000000140'  # Fake hold id
+        self.api.log.info('Test patron activity --> invalid patron ok!')
 
-        try:
-            response = self.api.release_hold(patron, pin, licensepool)
-            self.assertTrue(response,
-                            msg="Cannot release hold, response false " + licensepool.identifier.identifier + " patron: " + patron)
-            print 'Hold returned: %s' % licensepool.identifier.identifier
+    def test_42_patron_activity(self):
+        patron_checkouts_data, patron_checkouts_json = self.sample_json("patron_checkouts.json")
+        patron_holds_data, patron_holds_json = self.sample_json("patron_holds.json")
+        self.api.queue_response(200, content=patron_checkouts_json)
+        self.api.queue_response(200, content=patron_holds_json)
 
-        except CirculationException as e:
-            print 'CirculationException happend: ' + e.message
+        loans_and_holds = self.api.patron_activity(self.PATRON, self.PIN)
+        ok_(loans_and_holds)
+        eq_(12, len(loans_and_holds))
+        self.api.log.info('Test patron activity ok !!')
+
+    #################
+    # Checkin tests
+    #################
+
+    def test_51_checkin_patron_not_found(self):
+        patron_not_found_data, patron_not_found_json = self.sample_json("error_patron_not_found.json")
+        self.api.queue_response(404, content=patron_not_found_json)
+
+        assert_raises(PatronNotFoundOnRemote, self.api.checkin, self.PATRON, self.PIN, self.licensepool)
+
+        self.api.log.info('Test checkin --> invalid patron ok!')
+
+    def test_52_checkin_checkout_not_found(self):
+        checkout_not_found_data, checkout_not_found_json = self.sample_json("error_checkout_not_found.json")
+        self.api.queue_response(404, content=checkout_not_found_json)
+
+        assert_raises(NotCheckedOut, self.api.checkin, self.PATRON, self.PIN, self.licensepool)
+
+        self.api.log.info('Test checkin --> invalid checkout ok!')
+
+    def test_53_checkin(self):
+        checkout_data, checkout_json = self.sample_json("patron_checkouts.json")
+        self.api.queue_response(200, content=checkout_json)
+
+        checkin_data, checkin_json = self.sample_json("checkin_ok.json")
+        self.api.queue_response(200, content=checkin_json)
+
+        response = self.api.checkin(self.PATRON, self.PIN, self.licensepool)
+        eq_(response.status_code, 200,
+            msg="Response code != 200, cannot perform checkin for record: " + self.licensepool.identifier.identifier
+                + " patron: " + self.PATRON)
+
+        checkout_returned = response.json()
+
+        ok_(checkout_returned)
+        eq_('4318', checkout_returned['id'])
+        self.api.log.info('Checkout returned: %s' % checkout_returned['id'])
+
+    #################
+    # Patron Activity tests
+    #################
+
+    def test_61_return_hold_patron_not_found(self):
+        patron_not_found_data, patron_not_found_json = self.sample_json("error_patron_not_found.json")
+        self.api.queue_response(404, content=patron_not_found_json)
+
+        assert_raises(PatronNotFoundOnRemote, self.api.release_hold, self.PATRON, self.PIN, self.licensepool)
+
+        self.api.log.info('Test release hold --> invalid patron ok!')
+
+    def test_62_return_hold_not_found(self):
+        holds_data, holds_json = self.sample_json("patron_holds.json")
+        self.api.queue_response(200, content=holds_json)
+
+        checkin_data, checkin_json = self.sample_json("error_hold_not_found.json")
+        self.api.queue_response(404, content=checkin_json)
+
+        response = self.api.release_hold(self.PATRON, self.PIN, self.licensepool)
+        eq_(response, True,
+            msg="Cannot release hold, response false " + self.licensepool.identifier.identifier + " patron: "
+                + self.PATRON)
+
+        self.api.log.info('Hold returned: %s' % self.licensepool.identifier.identifier)
+
+    def test_63_return_hold(self):
+        holds_data, holds_json = self.sample_json("patron_holds.json")
+        self.api.queue_response(200, content=holds_json)
+
+        release_hold_ok_data, release_hold_ok_json = self.sample_json("release_hold_ok.json")
+        self.api.queue_response(200, content=release_hold_ok_json)
+
+        response = self.api.release_hold(self.PATRON, self.PIN, self.licensepool)
+        eq_(response, True,
+            msg="Cannot release hold, response false " + self.licensepool.identifier.identifier + " patron: "
+                + self.PATRON)
+
+        self.api.log.info('Hold returned: %s' % self.licensepool.identifier.identifier)
 
 
 class TestOdiloDiscoveryAPI(OdiloAPITest):
     def test_1_odilo_recent_circulation_monitor(self):
-        print 'Testing all library products'
+        monitor = RecentOdiloCollectionMonitor(self._db, self.collection, api_class=MockOdiloAPI)
+        ok_(monitor, 'Monitor null !!')
+        eq_(ExternalIntegration.ODILO, monitor.protocol, 'Wat??')
 
-        monitor = RecentOdiloCollectionMonitor(self._db, self.collection)
-        self.assertIsNotNone(monitor, 'Monitor null !!')
-        self.assertEqual(ExternalIntegration.ODILO, monitor.protocol, 'Wat??')
+        records_metadata_data, records_metadata_json = self.sample_json("records_metadata.json")
+        monitor.api.queue_response(200, content=records_metadata_data)
+
+        availability_data = self.sample_data("record_availability.json")
+        for record in records_metadata_json:
+            monitor.api.queue_response(200, content=availability_data)
+
+        monitor.api.queue_response(200, content='[]')  # No more resources retrieved
 
         monitor.run_once(start="2017-09-01", cutoff=None)
 
-        print 'Finished !!'
+        self.api.log.info('RecentOdiloCollectionMonitor finished ok!!')
 
     def test_2_odilo_full_circulation_monitor(self):
-        print 'Testing all library products'
+        monitor = FullOdiloCollectionMonitor(self._db, self.collection, api_class=MockOdiloAPI)
+        ok_(monitor, 'Monitor null !!')
+        eq_(ExternalIntegration.ODILO, monitor.protocol, 'Wat??')
 
-        monitor = FullOdiloCollectionMonitor(self._db, self.collection)
-        self.assertIsNotNone(monitor, 'Monitor null !!')
-        self.assertEqual(ExternalIntegration.ODILO, monitor.protocol, 'Wat??')
+        records_metadata_data, records_metadata_json = self.sample_json("records_metadata.json")
+        monitor.api.queue_response(200, content=records_metadata_data)
+
+        availability_data = self.sample_data("record_availability.json")
+        for record in records_metadata_json:
+            monitor.api.queue_response(200, content=availability_data)
+
+        monitor.api.queue_response(200, content='[]')  # No more resources retrieved
 
         monitor.run_once()
 
-        print 'Finished !!'
+        self.api.log.info('FullOdiloCollectionMonitor finished ok!!')
