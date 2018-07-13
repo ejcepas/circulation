@@ -130,7 +130,10 @@ class OdiloAPI(BaseOdiloAPI, BaseCirculationAPI):
         record_id = licensepool.identifier.identifier
 
         # Data just as 'x-www-form-urlencoded', no JSON
-        payload = dict(patronId=patron, format=internal_format)
+        payload = dict(
+            patronId=patron.authorization_identifier,
+            format=internal_format
+        )
 
         response = self.patron_request(
             patron, pin, self.CHECKOUT_ENDPOINT.format(recordId=record_id),
