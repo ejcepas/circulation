@@ -4,6 +4,7 @@ import logging
 import sys
 import urllib
 import datetime
+import base64
 from wsgiref.handlers import format_date_time
 from time import mktime
 
@@ -38,9 +39,11 @@ from core.external_search import (
 from core.facets import FacetConfig
 from core.log import LogConfiguration
 from core.lane import (
-    Facets, 
+    Facets,
+    FeaturedFacets,
     Pagination,
     Lane,
+    SearchFacets,
     WorkList,
 )
 from core.model import (
@@ -54,15 +57,19 @@ from core.model import (
     Collection,
     Complaint,
     ConfigurationSetting,
+    CustomList,
     DataSource,
     DeliveryMechanism,
+    Edition,
     ExternalIntegration,
     Hold,
     Identifier,
+    IntegrationClient,
     Library,
     LicensePool,
     Loan,
     LicensePoolDeliveryMechanism,
+    Patron,
     PatronProfileStorage,
     Representation,
     Session,
@@ -71,7 +78,8 @@ from core.model import (
 from core.opds import (
     AcquisitionFeed,
 )
-from core.util.opds_writer import (    
+from core.util import LanguageCodes
+from core.util.opds_writer import (
      OPDSFeed,
 )
 from core.opensearch import OpenSearchDocument
@@ -82,14 +90,19 @@ from core.util.flask_util import (
 from core.util.authentication_for_opds import AuthenticationForOPDSDocument
 from core.util.problem_detail import ProblemDetail
 from core.util.http import (
+    HTTP,
     RemoteIntegrationException,
 )
 
 from circulation_exceptions import *
+from custom_index import CustomIndexView
 
 from opds import (
     CirculationManagerAnnotator,
-    CirculationManagerLoanAndHoldAnnotator,
+    LibraryAnnotator,
+    SharedCollectionAnnotator,
+    LibraryLoanAndHoldAnnotator,
+    SharedCollectionLoanAndHoldAnnotator,
 )
 from annotations import (
   AnnotationWriter,
@@ -102,16 +115,20 @@ from authenticator import (
     OAuthController,
 )
 from config import (
-    Configuration, 
+    Configuration,
     CannotLoadConfiguration,
 )
 
 from lanes import (
     load_lanes,
     ContributorLane,
+    FeaturedSeriesFacets,
     RecommendationLane,
     RelatedBooksLane,
     SeriesLane,
+    CrawlableCollectionBasedLane,
+    CrawlableCustomListBasedLane,
+    CrawlableFacets,
 )
 
 from adobe_vendor_id import (
@@ -119,19 +136,18 @@ from adobe_vendor_id import (
     DeviceManagementProtocolController,
     AuthdataUtility,
 )
-from axis import Axis360API
-from overdrive import OverdriveAPI
-from bibliotheca import BibliothecaAPI
 from circulation import CirculationAPI
+from shared_collection import SharedCollectionAPI
 from odl import ODLWithConsolidatedCopiesAPI
 from novelist import (
     NoveListAPI,
     MockNoveListAPI,
 )
 from base_controller import BaseCirculationManagerController
-from testing import MockCirculationAPI
+from testing import MockCirculationAPI, MockSharedCollectionAPI
 from services import ServiceStatus
 from core.analytics import Analytics
+from accept_types import parse_header
 
 class CirculationManager(object):
 
@@ -153,7 +169,7 @@ class CirculationManager(object):
         )
         self.setup_one_time_controllers()
         self.load_settings()
-        
+
     def reload_settings_if_changed(self):
         """If the site configuration has been updated, reload the
         CirculationManager's configuration from the database.
@@ -162,7 +178,7 @@ class CirculationManager(object):
         if last_update > self.site_configuration_last_update:
             self.load_settings()
             self.site_configuration_last_update = last_update
-        
+
     def load_settings(self):
         """Load all necessary configuration settings and external
         integrations from the database.
@@ -177,18 +193,25 @@ class CirculationManager(object):
         self.auth = Authenticator(self._db, self.analytics)
 
         self.setup_external_search()
-        
+
         # Track the Lane configuration for each library by mapping its
         # short name to the top-level lane.
         new_top_level_lanes = {}
         # Create a CirculationAPI for each library.
         new_circulation_apis = {}
 
+        # Potentially load a CustomIndexView for each library
+        new_custom_index_views = {}
+
         new_adobe_device_management = None
         for library in self._db.query(Library):
             lanes = load_lanes(self._db, library)
-            
+
             new_top_level_lanes[library.id] = lanes
+
+            new_custom_index_views[library.id] = CustomIndexView.for_library(
+                library
+            )
 
             new_circulation_apis[library.id] = self.setup_circulation(
                 library, self.analytics
@@ -202,6 +225,8 @@ class CirculationManager(object):
         self.adobe_device_management = new_adobe_device_management
         self.top_level_lanes = new_top_level_lanes
         self.circulation_apis = new_circulation_apis
+        self.custom_index_views = new_custom_index_views
+        self.shared_collection_api = self.setup_shared_collection()
         self.lending_policy = load_lending_policy(
             Configuration.policy('lending', {})
         )
@@ -211,7 +236,7 @@ class CirculationManager(object):
 
         self.setup_configuration_dependent_controllers()
         self.authentication_for_opds_documents = {}
-    
+
     @property
     def external_search(self):
         """Retrieve or create a connection to the search interface.
@@ -262,13 +287,20 @@ class CirculationManager(object):
             return search
 
     def setup_circulation(self, library, analytics):
-        """Set up the Circulation object."""        
+        """Set up the Circulation object."""
         if self.testing:
             cls = MockCirculationAPI
         else:
             cls = CirculationAPI
         return cls(self._db, library, analytics)
-        
+
+    def setup_shared_collection(self):
+        if self.testing:
+            cls = MockSharedCollectionAPI
+        else:
+            cls = SharedCollectionAPI
+        return cls(self._db)
+
     def setup_one_time_controllers(self):
         """Set up all the controllers that will be used by the web app.
 
@@ -286,16 +318,17 @@ class CirculationManager(object):
         self.heartbeat = HeartbeatController()
         self.service_status = ServiceStatusController(self)
         self.odl_notification_controller = ODLNotificationController(self)
+        self.shared_collection_controller = SharedCollectionController(self)
 
     def setup_configuration_dependent_controllers(self):
-        """Set up all the controllers that depend on the 
+        """Set up all the controllers that depend on the
         current site configuration.
 
         This method will be called fresh every time the site
         configuration changes.
         """
-        self.oauth_controller = OAuthController(self.auth)        
-        
+        self.oauth_controller = OAuthController(self.auth)
+
     def setup_adobe_vendor_id(self, _db, library):
         """If this Library has an Adobe Vendor ID integration,
         configure the controller for it.
@@ -332,7 +365,8 @@ class CirculationManager(object):
                 )
             else:
                 self.log.warn("Adobe Vendor ID controller is disabled due to missing or incomplete configuration. This is probably nothing to worry about.")
-        self.adobe_vendor_id = new_adobe_vendor_id
+        if new_adobe_vendor_id:
+            self.adobe_vendor_id = new_adobe_vendor_id
 
         # But almost all libraries will have a Short Client Token
         # setup. We're not setting anything up here, but this is useful
@@ -363,9 +397,15 @@ class CirculationManager(object):
             library = lane.get_library(self._db)
         else:
             library = flask.request.library
-        return CirculationManagerAnnotator(
+
+        # Some features are only available if a patron authentication
+        # mechanism is set up for this library.
+        authenticator = self.auth.library_authenticators.get(library.short_name)
+        return LibraryAnnotator(
             self.circulation_apis[library.id], lane, library,
-            top_level_title='All Books', *args, **kwargs
+            top_level_title='All Books',
+            library_identifies_patrons=authenticator.identifies_individuals,
+            *args, **kwargs
         )
 
     @property
@@ -400,23 +440,35 @@ class CirculationManagerController(BaseCirculationManagerController):
         """Return the appropriate CirculationAPI for the request Library."""
         library_id = flask.request.library.id
         return self.manager.circulation_apis[library_id]
-    
+
+    @property
+    def shared_collection(self):
+        """Return the appropriate SharedCollectionAPI for the request library."""
+        return self.manager.shared_collection_api
+
     def load_lane(self, lane_identifier):
         """Turn user input into a Lane object."""
         library_id = flask.request.library.id
-        top_level_lane = self.manager.top_level_lanes[library_id]
 
         if lane_identifier is None:
-            return top_level_lane
-
-        lane = get_one(self._db, Lane, id=lane_identifier, library_id=library_id)
+            # Return the top-level lane.
+            lane = self.manager.top_level_lanes[library_id]
+            if isinstance(lane, Lane):
+                lane = self._db.merge(lane)
+            elif isinstance(lane, WorkList):
+                lane.children = [self._db.merge(child) for child in lane.children]
+        else:
+            lane = get_one(
+                self._db, Lane, id=lane_identifier, library_id=library_id
+            )
 
         if not lane:
             return NO_SUCH_LANE.detailed(
-                _("Lane %(lane_identifier)s does not exist or is not associated with library %(library_id)s", 
+                _("Lane %(lane_identifier)s does not exist or is not associated with library %(library_id)s",
                   lane_identifier=lane_identifier, library_id=library_id
                 )
             )
+
         return lane
 
     def load_work(self, library, identifier_type, identifier):
@@ -427,7 +479,7 @@ class CirculationManagerController(BaseCirculationManagerController):
         # We know there is at least one LicensePool, and all LicensePools
         # for an Identifier have the same Work.
         return pools[0].work
-    
+
     def load_licensepools(self, library, identifier_type, identifier):
         """Turn user input into one or more LicensePool objects.
 
@@ -464,7 +516,7 @@ class CirculationManagerController(BaseCirculationManagerController):
         return license_pool
 
     def load_licensepooldelivery(self, pool, mechanism_id):
-        """Turn user input into a LicensePoolDeliveryMechanism object.""" 
+        """Turn user input into a LicensePoolDeliveryMechanism object."""
         mechanism = get_one(
             self._db, LicensePoolDeliveryMechanism,
             data_source=pool.data_source, identifier=pool.identifier,
@@ -488,7 +540,7 @@ class CirculationManagerController(BaseCirculationManagerController):
             return FORBIDDEN_BY_POLICY.detailed(
                 _("Library policy prohibits the placement of holds."),
                 status_code=403
-            )        
+            )
         return None
 
 
@@ -496,6 +548,13 @@ class IndexController(CirculationManagerController):
     """Redirect the patron to the appropriate feed."""
 
     def __call__(self):
+        # If this library provides a custom index view, use that.
+        library = flask.request.library
+        custom = self.manager.custom_index_views.get(library.id)
+        if custom is not None:
+            annotator = self.manager.annotator(None)
+            return custom(library, annotator)
+
         # The simple case: the app is equally open to all clients.
         library_short_name = flask.request.library.short_name
         if not self.has_root_lanes():
@@ -554,10 +613,10 @@ class IndexController(CirculationManagerController):
                     library_short_name=library_short_name,
                 )
             )
-    
+
         return redirect(
             self.cdn_url_for(
-                'acquisition_groups', 
+                'acquisition_groups',
                 library_short_name=library_short_name,
                 lane_identifier=root_lane.id,
             )
@@ -579,16 +638,26 @@ class OPDSFeedController(CirculationManagerController):
         lane = self.load_lane(lane_identifier)
         if isinstance(lane, ProblemDetail):
             return lane
-        library_short_name = flask.request.library.short_name
+        library = flask.request.library
+        library_short_name = library.short_name
         url = self.cdn_url_for(
             "acquisition_groups", lane_identifier=lane_identifier, library_short_name=library_short_name,
         )
 
         title = lane.display_name
-
+        facet_class_kwargs = dict(
+            minimum_featured_quality=library.minimum_featured_quality,
+            uses_customlists=lane.uses_customlists
+        )
+        facets = load_facets_from_request(
+            worklist=lane, base_class=FeaturedFacets,
+            base_class_constructor_kwargs=facet_class_kwargs
+        )
         annotator = self.manager.annotator(lane)
-        feed = AcquisitionFeed.groups(self._db, title, url, lane, annotator)
-        return feed_response(feed.content)
+        feed = AcquisitionFeed.groups(
+            self._db, title, url, lane, annotator, facets=facets
+        )
+        return feed_response(feed)
 
     def feed(self, lane_identifier):
         """Build or retrieve a paginated acquisition feed."""
@@ -605,7 +674,7 @@ class OPDSFeedController(CirculationManagerController):
         title = lane.display_name
 
         annotator = self.manager.annotator(lane)
-        facets = load_facets_from_request()
+        facets = load_facets_from_request(worklist=lane)
         if isinstance(facets, ProblemDetail):
             return facets
         pagination = load_pagination_from_request()
@@ -616,7 +685,71 @@ class OPDSFeedController(CirculationManagerController):
             facets=facets,
             pagination=pagination,
         )
-        return feed_response(feed.content)
+        return feed_response(feed)
+
+    def crawlable_library_feed(self):
+        """Build or retrieve a crawlable acquisition feed for the
+        request library.
+        """
+        library = flask.request.library
+        library_short_name = flask.request.library.short_name
+        url = self.cdn_url_for(
+            "crawlable_library_feed",
+            library_short_name=library_short_name,
+        )
+        title = library.name
+        lane = CrawlableCollectionBasedLane(library)
+        return self._crawlable_feed(library, title, url, lane)
+
+    def crawlable_collection_feed(self, collection_name):
+        """Build or retrieve a crawlable acquisition feed for the
+        requested collection.
+        """
+        collection = get_one(self._db, Collection, name=collection_name)
+        if not collection:
+            return NO_SUCH_COLLECTION
+        title = collection.name
+        url = self.cdn_url_for(
+            "crawlable_collection_feed",
+            collection_name=collection.name
+        )
+        lane = CrawlableCollectionBasedLane(None, [collection])
+        if collection.protocol in [ODLWithConsolidatedCopiesAPI.NAME]:
+            annotator = SharedCollectionAnnotator(collection, lane)
+        else:
+            annotator = CirculationManagerAnnotator(lane)
+        return self._crawlable_feed(None, title, url, lane, annotator=annotator)
+
+    def crawlable_list_feed(self, list_name):
+        """Build or retrieve a crawlable, paginated acquisition feed for the
+        named CustomList, sorted by update date.
+        """
+        library = flask.request.library
+        list = CustomList.find(self._db, list_name, library=library)
+        if not list:
+            return NO_SUCH_LIST
+        library_short_name = library.short_name
+        title = list.name
+        url = self.cdn_url_for(
+            "crawlable_list_feed", list_name=list.name,
+            library_short_name=library_short_name,
+        )
+        lane = CrawlableCustomListBasedLane()
+        lane.initialize(library, list)
+        return self._crawlable_feed(library, title, url, lane)
+
+    def _crawlable_feed(self, library, title, url, lane, annotator=None):
+        annotator = annotator or self.manager.annotator(lane)
+        facets = CrawlableFacets.default(library)
+        pagination = load_pagination_from_request()
+        if isinstance(pagination, ProblemDetail):
+            return pagination
+        feed = AcquisitionFeed.page(
+            self._db, title, url, lane, annotator=annotator,
+            facets=facets,
+            pagination=pagination,
+        )
+        return feed_response(feed)
 
     def search(self, lane_identifier):
 
@@ -625,26 +758,50 @@ class OPDSFeedController(CirculationManagerController):
             return lane
         query = flask.request.args.get('q')
         library_short_name = flask.request.library.short_name
-        this_url = self.url_for(
+
+        language_header = flask.request.headers.get("Accept-Language")
+        if language_header:
+            languages = parse_header(language_header)
+            languages = map(str, languages)
+            languages = map(LanguageCodes.iso_639_2_for_locale, languages)
+            languages = [l for l in languages if l]
+        else:
+            languages = None
+
+        facets = load_facets_from_request(
+            worklist=lane, base_class=SearchFacets
+        )
+        kwargs = dict()
+        if languages:
+            kwargs['language'] = languages
+        kwargs.update(dict(facets.items()))
+
+        # Create a function that, when called, generates a URL to the
+        # search controller.
+        make_url = lambda: self.url_for(
             'lane_search', lane_identifier=lane_identifier,
             library_short_name=library_short_name,
+            **kwargs
         )
         if not query:
             # Send the search form
-            return OpenSearchDocument.for_lane(lane, this_url)
+            return OpenSearchDocument.for_lane(lane, make_url())
 
         pagination = load_pagination_from_request(default_size=Pagination.DEFAULT_SEARCH_SIZE)
         if isinstance(pagination, ProblemDetail):
             return pagination
 
-        # Run a search.    
-        this_url += "?q=" + urllib.quote(query.encode("utf8"))
+        # Run a search.
+        kwargs['q'] = query.encode("utf8")
+        this_url = make_url()
+
         annotator = self.manager.annotator(lane)
         info = OpenSearchDocument.search_info(lane)
         opds_feed = AcquisitionFeed.search(
-            _db=self._db, title=info['name'], 
+            _db=self._db, title=info['name'],
             url=this_url, lane=lane, search_engine=self.manager.external_search,
             query=query, annotator=annotator, pagination=pagination,
+            languages=languages, facets=facets
         )
         return feed_response(opds_feed)
 
@@ -652,6 +809,8 @@ class OPDSFeedController(CirculationManagerController):
 class LoanController(CirculationManagerController):
 
     def get_patron_circ_objects(self, object_class, patron, license_pools):
+        if not patron:
+            return []
         pool_ids = [pool.id for pool in license_pools]
 
         return self._db.query(object_class).filter(
@@ -694,7 +853,7 @@ class LoanController(CirculationManagerController):
                 )
 
         # Then make the feed.
-        feed = CirculationManagerLoanAndHoldAnnotator.active_loans_for(
+        feed = LibraryLoanAndHoldAnnotator.active_loans_for(
             self.circulation, patron)
         return feed_response(feed, cache_for=None)
 
@@ -770,10 +929,10 @@ class LoanController(CirculationManagerController):
         # a feed that tells the patron how to fulfill the loan. If a hold,
         # serve a feed that talks about the hold.
         if loan:
-            feed = CirculationManagerLoanAndHoldAnnotator.single_loan_feed(
+            feed = LibraryLoanAndHoldAnnotator.single_loan_feed(
                 self.circulation, loan)
         elif hold:
-            feed = CirculationManagerLoanAndHoldAnnotator.single_hold_feed(
+            feed = LibraryLoanAndHoldAnnotator.single_hold_feed(
                 self.circulation, hold)
         else:
             # This should never happen -- we should have sent a more specific
@@ -851,22 +1010,40 @@ class LoanController(CirculationManagerController):
             # criteria.
             return problem_doc
         return best, mechanism
-    
-    def fulfill(self, license_pool_id, mechanism_id=None, do_get=None):
-        """Fulfill a book that has already been checked out.
 
-        If successful, this will serve the patron a downloadable copy of
-        the book, or a DRM license file which can be used to get the
-        book). Alternatively, for a streaming delivery mechanism it may
-        serve an OPDS entry with a link to a third-party web page that
-        streams the content.
+    def fulfill(self, license_pool_id, mechanism_id=None, do_get=None):
+        """Fulfill a book that has already been checked out,
+        or which can be fulfilled with no active loan.
+
+        If successful, this will serve the patron a downloadable copy
+        of the book, a key (such as a DRM license file or bearer
+        token) which can be used to get the book, or an OPDS entry
+        containing a link to the book.
         """
         do_get = do_get or Representation.simple_http_get
 
-        patron = flask.request.patron
+        # Unlike most controller methods, this one has different
+        # behavior whether or not the patron is authenticated. This is
+        # why we're about to do something we don't usually do--call
+        # authenticated_patron_from_request from within a controller
+        # method.
+        authentication_response = self.authenticated_patron_from_request()
+        if isinstance(authentication_response, Patron):
+            # The patron is authenticated.
+            patron = authentication_response
+        else:
+            # The patron is not authenticated, either due to bad credentials
+            # (in which case authentication_response is a Response)
+            # or due to an integration error with the auth provider (in
+            # which case it is a ProblemDetail).
+            #
+            # There's still a chance this request can succeed, but if not,
+            # we'll be sending out authentication_response.
+            patron = None
+        library = flask.request.library
         header = self.authorization_header()
         credential = self.manager.auth.get_credential_from_header(header)
-    
+
         # Turn source + identifier into a LicensePool.
         pool = self.load_licensepool(license_pool_id)
         if isinstance(pool, ProblemDetail):
@@ -874,20 +1051,36 @@ class LoanController(CirculationManagerController):
 
         loan, loan_license_pool = self.get_patron_loan(patron, [pool])
 
-        if not loan or not loan_license_pool:
-            return NO_ACTIVE_LOAN.detailed(
-                _("You have no active loan for this title.")
-            )
-        
+        requested_license_pool = loan_license_pool or pool
+
         # Find the LicensePoolDeliveryMechanism they asked for.
         mechanism = None
         if mechanism_id:
             mechanism = self.load_licensepooldelivery(
-                loan_license_pool, mechanism_id
+                requested_license_pool, mechanism_id
             )
             if isinstance(mechanism, ProblemDetail):
                 return mechanism
-            
+
+        if (not loan or not loan_license_pool) and not (
+            self.can_fulfill_without_loan(
+                library, patron, requested_license_pool, mechanism
+            )
+        ):
+            if patron:
+                # Since a patron was identified, the problem is they have
+                # no active loan.
+                return NO_ACTIVE_LOAN.detailed(
+                    _("You have no active loan for this title.")
+                )
+            else:
+                # Since no patron was identified, the problem is
+                # whatever problem was revealed by the earlier
+                # authenticated_patron_from_request() call -- either the
+                # patron didn't authenticate or there's a problem
+                # integrating with the auth provider.
+                return authentication_response
+
         if not mechanism:
             # See if the loan already has a mechanism set. We can use that.
             if loan and loan.fulfillment:
@@ -896,15 +1089,15 @@ class LoanController(CirculationManagerController):
                 return BAD_DELIVERY_MECHANISM.detailed(
                     _("You must specify a delivery mechanism to fulfill this loan.")
                 )
-    
+
         try:
             fulfillment = self.circulation.fulfill(
-                patron, credential, loan.license_pool, mechanism
+                patron, credential, requested_license_pool, mechanism
             )
         except DeliveryMechanismConflict, e:
             return DELIVERY_CONFLICT.detailed(e.message)
         except NoActiveLoan, e:
-            return NO_ACTIVE_LOAN.detailed( 
+            return NO_ACTIVE_LOAN.detailed(
                     _('Can\'t fulfill loan because you have no active loan for this book.'),
                     status_code=e.status_code
             )
@@ -930,7 +1123,7 @@ class LoanController(CirculationManagerController):
         if mechanism.delivery_mechanism.is_streaming:
             # If this is a streaming delivery mechanism, create an OPDS entry
             # with a fulfillment link to the streaming reader url.
-            feed = CirculationManagerLoanAndHoldAnnotator.single_fulfillment_feed(
+            feed = LibraryLoanAndHoldAnnotator.single_fulfillment_feed(
                 self.circulation, loan, fulfillment)
             if isinstance(feed, OPDSFeed):
                 content = unicode(feed)
@@ -943,7 +1136,15 @@ class LoanController(CirculationManagerController):
             if fulfillment.content_link:
                 # If we have a link to the content on a remote server, web clients may not
                 # be able to access it if the remote server does not support CORS requests.
-                # We need to fetch the content and return it instead of redirecting to it.
+
+                # If the pool is open access though, the web client can link directly to the
+                # file to download it, so it's safe to redirect.
+                if requested_license_pool.open_access:
+                    return redirect(fulfillment.content_link)
+
+                # Otherwise, we need to fetch the content and return it instead
+                # of redirecting to it, since it may be downloaded through an
+                # indirect acquisition link.
                 try:
                     status_code, headers, content = do_get(fulfillment.content_link, headers=encoding_header)
                     headers = dict(headers)
@@ -955,6 +1156,34 @@ class LoanController(CirculationManagerController):
                 headers['Content-Type'] = fulfillment.content_type
 
         return Response(content, status_code, headers)
+
+    def can_fulfill_without_loan(self, library, patron, pool, lpdm):
+        """Is it acceptable to fulfill the given LicensePoolDeliveryMechanism
+        for the given Patron without creating a Loan first?
+
+        This question is usually asked because no Patron has been
+        authenticated, and thus no Loan can be created, but somebody
+        wants a book anyway.
+
+        :param library: A Library.
+        :param patron: A Patron, probably None.
+        :param lpdm: A LicensePoolDeliveryMechanism.
+        """
+        authenticator = self.manager.auth.library_authenticators.get(library.short_name)
+        if authenticator and authenticator.identifies_individuals:
+            # This library identifies individual patrons, so there is
+            # no reason to fulfill books without a loan. Even if the
+            # books are free and the 'loans' are nominal, having a
+            # Loan object makes it possible for a patron to sync their
+            # collection across devices, so that's the way we do it.
+            return False
+
+        # If the library doesn't require that individual patrons
+        # identify themselves, it's up to the CirculationAPI object.
+        # Most of them will say no. (This would indicate that the
+        # collection is improperly associated with a library that
+        # doesn't identify its patrons.)
+        return self.circulation.can_fulfill_without_loan(patron, pool, lpdm)
 
     def revoke(self, license_pool_id):
         patron = flask.request.patron
@@ -1023,7 +1252,7 @@ class LoanController(CirculationManagerController):
             hold, pool = self.get_patron_hold(patron, pools)
 
         if not loan and not hold:
-            return NO_ACTIVE_LOAN_OR_HOLD.detailed( 
+            return NO_ACTIVE_LOAN_OR_HOLD.detailed(
                 _('You have no active loan or hold for "%(title)s".', title=pool.work.title),
                 status_code=404
             )
@@ -1033,7 +1262,7 @@ class LoanController(CirculationManagerController):
                 feed = CirculationManagerLoanAndHoldAnnotator.single_loan_feed(
                     self.circulation, loan)
             else:
-                feed = CirculationManagerLoanAndHoldAnnotator.single_hold_feed(
+                feed = LibraryLoanAndHoldAnnotator.single_hold_feed(
                     self.circulation, hold)
             feed = unicode(feed)
             return feed_response(feed, None)
@@ -1084,7 +1313,7 @@ class AnnotationController(CirculationManagerController):
         id_obj, ignore = Identifier.for_foreign_id(
             self._db, identifier_type, identifier)
         return self.container(identifier=id_obj, accept_post=False)
- 
+
     def detail(self, annotation_id):
         headers = dict()
         headers['Allow'] = 'GET,HEAD,OPTIONS,DELETE'
@@ -1137,7 +1366,7 @@ class WorkController(CirculationManagerController):
         )
 
         annotator = self.manager.annotator(lane)
-        facets = load_facets_from_request()
+        facets = load_facets_from_request(worklist=lane)
         if isinstance(facets, ProblemDetail):
             return facets
         pagination = load_pagination_from_request()
@@ -1154,7 +1383,7 @@ class WorkController(CirculationManagerController):
             facets=facets, pagination=pagination,
             annotator=annotator, cache_type=CachedFeed.CONTRIBUTOR_TYPE
         )
-        return feed_response(unicode(feed.content))
+        return feed_response(unicode(feed))
 
     def permalink(self, identifier_type, identifier):
         """Serve an entry for a single book.
@@ -1197,7 +1426,9 @@ class WorkController(CirculationManagerController):
             return NO_SUCH_LANE.detailed(e.message)
 
         annotator = self.manager.annotator(lane)
-        facets = load_facets_from_request()
+        facets = load_facets_from_request(
+            worklist=lane, base_class=FeaturedSeriesFacets
+        )
         if isinstance(facets, ProblemDetail):
             return facets
         pagination = load_pagination_from_request()
@@ -1210,9 +1441,10 @@ class WorkController(CirculationManagerController):
         )
 
         feed = AcquisitionFeed.groups(
-            self._db, lane.DISPLAY_NAME, url, lane, annotator=annotator
+            self._db, lane.DISPLAY_NAME, url, lane, annotator=annotator,
+            facets=facets
         )
-        return feed_response(unicode(feed.content))
+        return feed_response(unicode(feed))
 
     def recommendations(self, identifier_type, identifier, novelist_api=None):
         """Serve a feed of recommendations related to a given book."""
@@ -1232,7 +1464,7 @@ class WorkController(CirculationManagerController):
             return NO_SUCH_LANE.detailed(_("Recommendations not available"))
 
         annotator = self.manager.annotator(lane)
-        facets = load_facets_from_request()
+        facets = load_facets_from_request(worklist=lane)
         if isinstance(facets, ProblemDetail):
             return facets
         pagination = load_pagination_from_request()
@@ -1249,7 +1481,7 @@ class WorkController(CirculationManagerController):
             facets=facets, pagination=pagination,
             annotator=annotator, cache_type=CachedFeed.RECOMMENDATIONS_TYPE
         )
-        return feed_response(unicode(feed.content))
+        return feed_response(unicode(feed))
 
     def report(self, identifier_type, identifier):
         """Report a problem with a book."""
@@ -1264,13 +1496,13 @@ class WorkController(CirculationManagerController):
         if isinstance(pools, ProblemDetail):
             # Something went wrong.
             return pools
-    
+
         if flask.request.method == 'GET':
             # Return a list of valid URIs to use as the type of a problem detail
             # document.
             data = "\n".join(Complaint.VALID_TYPES)
             return Response(data, 200, {"Content-Type" : "text/uri-list"})
-    
+
         data = flask.request.data
         controller = ComplaintController()
         return controller.register(pools[0], data)
@@ -1294,8 +1526,13 @@ class WorkController(CirculationManagerController):
         facet_config.set_default_facet(
             Facets.ORDER_FACET_GROUP_NAME, Facets.ORDER_SERIES_POSITION
         )
-        
-        facets = load_facets_from_request(facet_config=facet_config)
+
+        # TODO: It would be nice to be able to adapt
+        # FeaturedSeriesFacets so that it can also be used as the
+        # Facets object for the full series lane.
+        facets = load_facets_from_request(
+            worklist=lane, facet_config=facet_config
+        )
         if isinstance(facets, ProblemDetail):
             return facets
         pagination = load_pagination_from_request()
@@ -1312,7 +1549,7 @@ class WorkController(CirculationManagerController):
             facets=facets, pagination=pagination,
             annotator=annotator, cache_type=CachedFeed.SERIES_TYPE
         )
-        return feed_response(unicode(feed.content))
+        return feed_response(unicode(feed))
 
 
 class ProfileController(CirculationManagerController):
@@ -1325,7 +1562,7 @@ class ProfileController(CirculationManagerController):
         patron = self.authenticated_patron_from_request()
         storage = PatronProfileStorage(patron)
         return CoreProfileController(storage)
-        
+
     def protocol(self):
         """Handle a UPMP request."""
         controller = self._controller
@@ -1402,3 +1639,231 @@ class ODLNotificationController(CirculationManagerController):
         api = self.manager.circulation_apis[library.id].api_for_license_pool(loan.license_pool)
         api.update_loan(loan, json.loads(status_doc))
         return Response(_('Success'), 200)
+
+class SharedCollectionController(CirculationManagerController):
+    """Enable this circulation manager to share its collections with
+    libraries on other circulation managers, for collection types that
+    support it."""
+    def info(self, collection_name):
+        """Return an OPDS2 catalog-like document with a link to register."""
+        collection = get_one(self._db, Collection, name=collection_name)
+        if not collection:
+            return NO_SUCH_COLLECTION
+
+        register_url = self.url_for('shared_collection_register',
+                                    collection_name=collection_name)
+        register_link = dict(href=register_url, rel='register')
+        content = json.dumps(dict(links=[register_link]))
+        headers = dict()
+        headers["Content-Type"] = "application/opds+json;profile=https://librarysimplified.org/rel/profile/directory"
+        return Response(content, 200, headers)
+
+    def load_collection(self, collection_name):
+        collection = get_one(self._db, Collection, name=collection_name)
+        if not collection:
+            return NO_SUCH_COLLECTION
+        return collection
+
+    def register(self, collection_name):
+        collection = self.load_collection(collection_name)
+        if isinstance(collection, ProblemDetail):
+            return collection
+        url = flask.request.form.get("url")
+        try:
+            response = self.shared_collection.register(collection, url)
+        except InvalidInputException, e:
+            return INVALID_REGISTRATION.detailed(str(e))
+        except AuthorizationFailedException, e:
+            return INVALID_CREDENTIALS.detailed(str(e))
+        except RemoteInitiatedServerError, e:
+            return e.as_problem_detail_document(debug=False)
+
+        return Response(json.dumps(response), 200)
+
+    def authenticated_client_from_request(self):
+        header = flask.request.headers.get('Authorization')
+        if header and 'bearer' in header.lower():
+            shared_secret = base64.b64decode(header.split(' ')[1])
+            client = IntegrationClient.authenticate(self._db, shared_secret)
+            if client:
+                return client
+        return INVALID_CREDENTIALS
+
+    def loan_info(self, collection_name, loan_id):
+        collection = self.load_collection(collection_name)
+        if isinstance(collection, ProblemDetail):
+            return collection
+        client = self.authenticated_client_from_request()
+        if isinstance(client, ProblemDetail):
+            return client
+        loan = get_one(self._db, Loan, id=loan_id, integration_client=client)
+        if not loan or loan.license_pool.collection != collection:
+            return LOAN_NOT_FOUND
+
+        feed = SharedCollectionLoanAndHoldAnnotator.single_loan_feed(
+            collection, loan)
+        headers = { "Content-Type" : OPDSFeed.ACQUISITION_FEED_TYPE }
+        return Response(etree.tostring(feed), 200, headers)
+
+    def borrow(self, collection_name, identifier_type, identifier, hold_id):
+        collection = self.load_collection(collection_name)
+        if isinstance(collection, ProblemDetail):
+            return collection
+        client = self.authenticated_client_from_request()
+        if isinstance(client, ProblemDetail):
+            return client
+        if identifier_type and identifier:
+            pools = self._db.query(LicensePool).join(
+                LicensePool.identifier).filter(
+                    Identifier.type==identifier_type
+                ).filter(
+                    Identifier.identifier==identifier
+                ).filter(
+                    LicensePool.collection_id==collection.id
+                ).all()
+            if not pools:
+                return NO_LICENSES.detailed(
+                    _("The item you're asking about (%s/%s) isn't in this collection.") % (
+                        identifier_type, identifier
+                    )
+                )
+            pool = pools[0]
+            hold = None
+        elif hold_id:
+            hold = get_one(self._db, Hold, id=hold_id)
+            pool = hold.license_pool
+
+        try:
+            loan = self.shared_collection.borrow(collection, client, pool, hold)
+        except AuthorizationFailedException, e:
+            return INVALID_CREDENTIALS.detailed(str(e))
+        except NoAvailableCopies, e:
+            return NO_AVAILABLE_LICENSE.detailed(str(e))
+        except CannotLoan, e:
+            return CHECKOUT_FAILED.detailed(str(e))
+        except RemoteIntegrationException, e:
+            return e.as_problem_detail_document(debug=False)
+        if loan and isinstance(loan, Loan):
+            feed = SharedCollectionLoanAndHoldAnnotator.single_loan_feed(
+                collection, loan)
+            headers = { "Content-Type" : OPDSFeed.ACQUISITION_FEED_TYPE }
+            return Response(etree.tostring(feed), 201, headers)
+        elif loan and isinstance(loan, Hold):
+            feed = SharedCollectionLoanAndHoldAnnotator.single_hold_feed(
+                collection, loan)
+            headers = { "Content-Type" : OPDSFeed.ACQUISITION_FEED_TYPE }
+            return Response(etree.tostring(feed), 201, headers)
+
+    def revoke_loan(self, collection_name, loan_id):
+        collection = self.load_collection(collection_name)
+        if isinstance(collection, ProblemDetail):
+            return collection
+        client = self.authenticated_client_from_request()
+        if isinstance(client, ProblemDetail):
+            return client
+        loan = get_one(self._db, Loan, id=loan_id, integration_client=client)
+        if not loan or not loan.license_pool.collection == collection:
+            return LOAN_NOT_FOUND
+
+        try:
+            self.shared_collection.revoke_loan(collection, client, loan)
+        except AuthorizationFailedException, e:
+            return INVALID_CREDENTIALS.detailed(str(e))
+        except NotCheckedOut, e:
+            return NO_ACTIVE_LOAN.detailed(str(e))
+        except CannotReturn, e:
+            return COULD_NOT_MIRROR_TO_REMOTE.detailed(str(e))
+        return Response(_("Success"), 200)
+
+    def fulfill(self, collection_name, loan_id, mechanism_id, do_get=HTTP.get_with_timeout):
+        collection = self.load_collection(collection_name)
+        if isinstance(collection, ProblemDetail):
+            return collection
+        client = self.authenticated_client_from_request()
+        if isinstance(client, ProblemDetail):
+            return client
+        loan = get_one(self._db, Loan, id=loan_id)
+        if not loan or not loan.license_pool.collection == collection:
+            return LOAN_NOT_FOUND
+
+        mechanism = None
+        if mechanism_id:
+            mechanism = self.load_licensepooldelivery(
+                loan.license_pool, mechanism_id
+            )
+            if isinstance(mechanism, ProblemDetail):
+                return mechanism
+
+        if not mechanism:
+            # See if the loan already has a mechanism set. We can use that.
+            if loan and loan.fulfillment:
+                mechanism = loan.fulfillment
+            else:
+                return BAD_DELIVERY_MECHANISM.detailed(
+                    _("You must specify a delivery mechanism to fulfill this loan.")
+                )
+
+        try:
+            fulfillment = self.shared_collection.fulfill(collection, client, loan, mechanism)
+        except AuthorizationFailedException, e:
+            return INVALID_CREDENTIALS.detailed(str(e))
+        except CannotFulfill, e:
+            return CANNOT_FULFILL.detailed(str(e))
+        except RemoteIntegrationException, e:
+            return e.as_problem_detail_document(debug=False)
+        headers = dict()
+        content = fulfillment.content
+        if fulfillment.content_link:
+            # If we have a link to the content on a remote server, web clients may not
+            # be able to access it if the remote server does not support CORS requests.
+            # We need to fetch the content and return it instead of redirecting to it.
+            try:
+                response = do_get(fulfillment.content_link)
+                status_code = response.status_code
+                headers = dict(response.headers)
+                content = response.content
+            except RemoteIntegrationException, e:
+                return e.as_problem_detail_document(debug=False)
+        else:
+            status_code = 200
+        if fulfillment.content_type:
+            headers['Content-Type'] = fulfillment.content_type
+
+        return Response(content, status_code, headers)
+
+    def hold_info(self, collection_name, hold_id):
+        collection = self.load_collection(collection_name)
+        if isinstance(collection, ProblemDetail):
+            return collection
+        client = self.authenticated_client_from_request()
+        if isinstance(client, ProblemDetail):
+            return client
+        hold = get_one(self._db, Hold, id=hold_id, integration_client=client)
+        if not hold or not hold.license_pool.collection == collection:
+            return HOLD_NOT_FOUND
+
+        feed = SharedCollectionLoanAndHoldAnnotator.single_hold_feed(
+            collection, hold)
+        headers = { "Content-Type" : OPDSFeed.ACQUISITION_FEED_TYPE }
+        return Response(etree.tostring(feed), 200, headers)
+
+    def revoke_hold(self, collection_name, hold_id):
+        collection = self.load_collection(collection_name)
+        if isinstance(collection, ProblemDetail):
+            return collection
+        client = self.authenticated_client_from_request()
+        if isinstance(client, ProblemDetail):
+            return client
+        hold = get_one(self._db, Hold, id=hold_id, integration_client=client)
+        if not hold or not hold.license_pool.collection == collection:
+            return HOLD_NOT_FOUND
+
+        try:
+            self.shared_collection.revoke_hold(collection, client, hold)
+        except AuthorizationFailedException, e:
+            return INVALID_CREDENTIALS.detailed(str(e))
+        except NotOnHold, e:
+            return NO_ACTIVE_HOLD.detailed(str(e))
+        except CannotReleaseHold, e:
+            return CANNOT_RELEASE_HOLD.detailed(str(e))
+        return Response(_("Success"), 200)

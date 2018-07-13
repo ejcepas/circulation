@@ -19,7 +19,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import (
-    contains_eager, 
+    contains_eager,
     defer
 )
 from psycopg2.extras import NumericRange
@@ -27,8 +27,15 @@ from psycopg2.extras import NumericRange
 from core import log
 from core.lane import Lane
 from core.classifier import Classifier
+from core.metadata_layer import (
+    CirculationData,
+    FormatData,
+    ReplacementPolicy,
+    LinkData,
+)
 from core.model import (
     CirculationEvent,
+    Collection,
     ConfigurationSetting,
     Contribution,
     Credential,
@@ -46,6 +53,7 @@ from core.model import (
     LicensePoolDeliveryMechanism,
     Loan,
     Representation,
+    RightsStatus,
     Subject,
     Timestamp,
     Work,
@@ -64,6 +72,7 @@ from core.scripts import (
 from core.lane import (
     Pagination,
     Facets,
+    FeaturedFacets,
 )
 from core.opds_import import (
     MetadataWranglerOPDSLookup,
@@ -72,12 +81,13 @@ from core.opds_import import (
 from core.opds import (
     AcquisitionFeed,
 )
-from core.util.opds_writer import (    
+from core.util.opds_writer import (
      OPDSFeed,
 )
 from core.external_list import CustomListFromCSV
 from core.external_search import ExternalSearchIndex
 from core.util import LanguageCodes
+from core.mirror import MirrorUploader
 
 from api.config import (
     CannotLoadConfiguration,
@@ -113,8 +123,15 @@ from api.opds_for_distributors import (
 from api.odl import (
     ODLBibliographicImporter,
     ODLBibliographicImportMonitor,
+    SharedODLImporter,
+    SharedODLImportMonitor,
 )
 from core.scripts import OPDSImportScript
+from api.novelist import (
+    NoveListAPI
+)
+from api.marc import MARCExtractor
+from api.onix import ONIXExtractor
 
 class Script(CoreScript):
     def load_config(self):
@@ -175,7 +192,7 @@ class CreateWorksForIdentifiersScript(Script):
 
         if response.status_code != 200:
             raise Exception(response.text)
-            
+
         content_type = response.headers['content-type']
         if content_type != OPDSFeed.ACQUISITION_FEED_TYPE:
             raise Exception("Wrong media type: %s" % content_type)
@@ -184,7 +201,7 @@ class CreateWorksForIdentifiersScript(Script):
             self._db, response.text,
             overwrite_rels=[Hyperlink.DESCRIPTION, Hyperlink.IMAGE])
         imported, messages_by_id = importer.import_from_feed()
-        self.log.info("%d successes, %d failures.", 
+        self.log.info("%d successes, %d failures.",
                       len(imported), len(messages_by_id))
         self._db.commit()
 
@@ -289,10 +306,10 @@ class UpdateStaffPicksScript(Script):
             self._db, url, do_get=Representation.browser_http_get,
             accept="text/csv", max_age=timedelta(days=1))
         if representation.status_code != 200:
-            raise ValueError("Unexpected status code %s" % 
+            raise ValueError("Unexpected status code %s" %
                              representation.status_code)
         if not representation.media_type.startswith("text/csv"):
-            raise ValueError("Unexpected media type %s" % 
+            raise ValueError("Unexpected media type %s" %
                              representation.media_type)
         return StringIO(representation.content)
 
@@ -305,18 +322,18 @@ class CacheRepresentationPerLane(LaneSweeperScript):
     def arg_parser(cls, _db):
         parser = LaneSweeperScript.arg_parser(_db)
         parser.add_argument(
-            '--language', 
+            '--language',
             help='Process only lanes that include books in this language.',
             action='append'
         )
         parser.add_argument(
-            '--max-depth', 
+            '--max-depth',
             help='Stop processing lanes once you reach this depth.',
             type=int,
             default=None
         )
         parser.add_argument(
-            '--min-depth', 
+            '--min-depth',
             help='Start processing lanes once you reach this depth.',
             type=int,
             default=1
@@ -327,10 +344,10 @@ class CacheRepresentationPerLane(LaneSweeperScript):
         super(CacheRepresentationPerLane, self).__init__(_db, *args, **kwargs)
         self.parse_args(cmd_args)
         from api.app import app
-        app.manager = CirculationManager(_db, testing=testing)
+        app.manager = CirculationManager(self._db, testing=testing)
         self.app = app
-        self.base_url = ConfigurationSetting.sitewide(_db, Configuration.BASE_URL_KEY).value
-        
+        self.base_url = ConfigurationSetting.sitewide(self._db, Configuration.BASE_URL_KEY).value
+
     def parse_args(self, cmd_args=None):
         parser = self.arg_parser(self._db)
         parsed = parser.parse_args(cmd_args)
@@ -348,7 +365,7 @@ class CacheRepresentationPerLane(LaneSweeperScript):
         # Return the parsed arguments in case a subclass needs to
         # process more args.
         return parsed
-    
+
     def should_process_lane(self, lane):
         if not isinstance(lane, Lane):
             return False
@@ -357,23 +374,23 @@ class CacheRepresentationPerLane(LaneSweeperScript):
         if not self.languages:
             # We are considering lanes for every single language.
             language_ok = True
-        
+
         if not lane.languages:
             # The lane has no language restrictions.
             language_ok = True
-        
+
         for language in self.languages:
             if language in lane.languages:
                 language_ok = True
                 break
         if not language_ok:
             return False
-        
+
         if self.max_depth is not None and lane.depth > self.max_depth:
             return False
         if self.min_depth is not None and lane.depth < self.min_depth:
             return False
-        
+
         return True
 
     def cache_url(self, annotator, lane, languages):
@@ -406,18 +423,18 @@ class CacheRepresentationPerLane(LaneSweeperScript):
         self.log.info("Generating feed(s) for %s", lane.full_identifier)
         cached_feeds = list(self.do_generate(lane))
         b = time.time()
-        total_size = sum(len(x.content) for x in cached_feeds if x)
+        total_size = sum(len(x) for x in cached_feeds if x)
         self.log.info(
             "Generated %d feed(s) for %s. Took %.2fsec to make %d bytes.",
             len(cached_feeds), lane.full_identifier, (b-a), total_size
         )
         return cached_feeds
-        
+
 class CacheFacetListsPerLane(CacheRepresentationPerLane):
     """Cache the first two pages of every relevant facet list for this lane."""
 
     name = "Cache OPDS feeds"
-    
+
     @classmethod
     def arg_parser(cls, _db):
         parser = CacheRepresentationPerLane.arg_parser(_db)
@@ -453,7 +470,7 @@ class CacheFacetListsPerLane(CacheRepresentationPerLane):
             action='append',
             default=[],
         )
-        
+
         default_pages = 2
         parser.add_argument(
             '--pages',
@@ -462,7 +479,7 @@ class CacheFacetListsPerLane(CacheRepresentationPerLane):
             default=default_pages
         )
         return parser
-    
+
     def parse_args(self, cmd_args=None):
         parsed = super(CacheFacetListsPerLane, self).parse_args(cmd_args)
         self.orders = parsed.order
@@ -474,22 +491,22 @@ class CacheFacetListsPerLane(CacheRepresentationPerLane):
     def do_generate(self, lane):
         feeds = []
         annotator = self.app.manager.annotator(lane)
-        if isinstance(lane, Lane) and lane.parent:
-            languages = lane.language_key
-            lane_name = lane.name
+        if isinstance(lane, Lane):
+            lane_id = lane.id
         else:
-            languages = None
-            lane_name = None
+            # Presumably this is the top-level WorkList.
+            lane_id = None
 
-        library = lane.library
+        library = lane.get_library(self._db)
         url = self.app.manager.cdn_url_for(
-            "feed", languages=languages, lane_name=lane_name, library_short_name=library.short_name
+            "feed", lane_identifier=lane_id,
+            library_short_name=library.short_name
         )
 
         default_order = library.default_facet(Facets.ORDER_FACET_GROUP_NAME)
         allowed_orders = library.enabled_facets(Facets.ORDER_FACET_GROUP_NAME)
         chosen_orders = self.orders or [default_order]
-        
+
         default_availability = library.default_facet(
             Facets.AVAILABILITY_FACET_GROUP_NAME
         )
@@ -497,15 +514,15 @@ class CacheFacetListsPerLane(CacheRepresentationPerLane):
             Facets.AVAILABILITY_FACET_GROUP_NAME
         )
         chosen_availabilities = self.availabilities or [default_availability]
-        
+
         default_collection = library.default_facet(
             Facets.COLLECTION_FACET_GROUP_NAME
         )
         allowed_collections = library.enabled_facets(
             Facets.COLLECTION_FACET_GROUP_NAME
-        )        
+        )
         chosen_collections = self.collections or [default_collection]
-        
+
         for order in chosen_orders:
             if order not in allowed_orders:
                 logging.warn("Ignoring unsupported ordering %s" % order)
@@ -527,7 +544,7 @@ class CacheFacetListsPerLane(CacheRepresentationPerLane):
                     title = lane.display_name
                     for pagenum in range(0, self.pages):
                         yield AcquisitionFeed.page(
-                            self._db, title, url, lane, annotator, 
+                            self._db, title, url, lane, annotator,
                             facets=facets, pagination=pagination,
                             force_refresh=True
                         )
@@ -540,7 +557,7 @@ class CacheOPDSGroupFeedPerLane(CacheRepresentationPerLane):
 
     def should_process_lane(self, lane):
         # OPDS group feeds are only generated for lanes that have sublanes.
-        if not lane.sublanes:
+        if not lane.children:
             return False
         if self.max_depth and lane.depth > self.max_depth:
             return False
@@ -550,20 +567,33 @@ class CacheOPDSGroupFeedPerLane(CacheRepresentationPerLane):
         feeds = []
         annotator = self.app.manager.annotator(lane)
         title = lane.display_name
-        if isinstance(lane, Lane) and lane.parent:
-            languages = lane.language_key
-            lane_name = lane.name
+
+        if isinstance(lane, Lane):
+            lane_id = lane.id
         else:
-            languages = None
-            lane_name = None
-        library = lane.library
-        url = self.app.manager.cdn_url_for(
-            "acquisition_groups", languages=languages, lane_name=lane_name, library_short_name=library.short_name
-        )
-        yield AcquisitionFeed.groups(
-            self._db, title, url, lane, annotator,
-            force_refresh=True
-        )
+            # Presumably this is the top-level WorkList.
+            lane_id = None
+        library = lane.get_library(self._db)
+
+        # If the WorkList has explicitly defined EntryPoints, we want to
+        # create a grouped feed for each EntryPoint. Otherwise, we want
+        # to create a single grouped feed with no particular EntryPoint.
+        entrypoints = lane.entrypoints or [None]
+        for entrypoint in entrypoints:
+            facets = FeaturedFacets(
+                minimum_featured_quality=library.minimum_featured_quality,
+                uses_customlists=lane.uses_customlists,
+                entrypoint=entrypoint
+            )
+            kwargs = dict(facets.items())
+            url = self.app.manager.cdn_url_for(
+                "acquisition_groups", lane_identifier=lane_id,
+                library_short_name=library.short_name, **kwargs
+            )
+            yield AcquisitionFeed.groups(
+                self._db, title, url, lane, annotator,
+                force_refresh=True, facets=facets
+            )
 
 
 class AdobeAccountIDResetScript(PatronInputScript):
@@ -577,7 +607,7 @@ class AdobeAccountIDResetScript(PatronInputScript):
             action='store_true'
         )
         return parser
-    
+
     def do_run(self, *args, **kwargs):
         parsed = self.parse_command_line(self._db, *args, **kwargs)
         patrons = parsed.patrons
@@ -605,7 +635,7 @@ You'll get another chance to back out before the database session is committed."
             self.log.warn("All done. Sleeping for five seconds before committing.")
             time.sleep(5)
             self._db.commit()
-        
+
     def process_patron(self, patron):
         """Delete all of a patron's Credentials that contain an Adobe account
         ID _or_ connect the patron to a DelegatedPatronIdentifier that
@@ -661,7 +691,7 @@ class AvailabilityRefreshScript(IdentifierInputScript):
             raise Exception(
                 "You must specify at least one identifier to refresh."
             )
-        
+
         # We don't know exactly how big to make these batches, but 10 is
         # always safe.
         start = 0
@@ -688,7 +718,7 @@ class AvailabilityRefreshScript(IdentifierInputScript):
         else:
             self.log.warn("Cannot update coverage for %r" % identifier.type)
 
-    
+
 class LanguageListScript(LibraryInputScript):
     """List all the languages with at least one non-open access work
     in the collection.
@@ -725,7 +755,7 @@ class CompileTranslationsScript(Script):
 
             os.system("rm %(path)s/messages.po" % dict(path=base_path))
             os.system("cat %(path)s/*.po > %(path)s/messages.po" % dict(path=base_path))
-        
+
         os.system("pybabel compile -f -d translations")
 
 
@@ -820,7 +850,7 @@ class DisappearingBookReportScript(Script):
     """Print a TSV-format report on books that used to be in the
     collection, or should be in the collection, but aren't.
     """
-    
+
     def do_run(self):
         qu = self._db.query(LicensePool).filter(
             LicensePool.open_access==False).filter(
@@ -877,7 +907,7 @@ class DisappearingBookReportScript(Script):
             for item in l:
                 if not last_seen or item.start > last_seen:
                     last_seen = item.start
-                    
+
         # Now we look for relevant circulation events. First, an event
         # where the title was explicitly removed is pretty clearly
         # a 'last seen'.
@@ -892,7 +922,7 @@ class DisappearingBookReportScript(Script):
             candidate = title_removal_events[-1].start
             if not last_seen or candidate > last_seen:
                 last_seen = candidate
-        
+
         # Also look for an event where the title went from a nonzero
         # number of licenses to a zero number of licenses. That's a
         # good 'last seen'.
@@ -906,7 +936,7 @@ class DisappearingBookReportScript(Script):
             candidate = license_removal_events[-1].start
             if not last_seen or candidate > last_seen:
                 last_seen = candidate
-        
+
         return last_seen, title_removal_events, license_removal_events
 
     format = "%Y-%m-%d"
@@ -946,7 +976,7 @@ class DisappearingBookReportScript(Script):
         title_removals = [event.start.strftime(self.format)
                           for event in title_removal_events]
         data.append(", ".join(title_removals))
-        
+
         print "\t".join([unicode(x).encode("utf8") for x in data])
 
 
@@ -993,6 +1023,372 @@ class OPDSForDistributorsReaperScript(OPDSImportScript):
     IMPORTER_CLASS = OPDSForDistributorsImporter
     MONITOR_CLASS = OPDSForDistributorsReaperMonitor
     PROTOCOL = OPDSForDistributorsImporter.NAME
+
+
+class DirectoryImportScript(Script):
+    """Import some books into a collection, based on a file containing
+    metadata and directories containing ebook and cover files.
+    """
+
+    @classmethod
+    def arg_parser(cls, _db):
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            '--collection-name',
+            help=u'Titles will be imported into a collection with this name. The collection will be created if it does not already exist.',
+            required=True
+        )
+        parser.add_argument(
+            '--data-source-name',
+            help=u'All data associated with this import activity will be recorded as originating with this data source. The data source will be created if it does not already exist.',
+            required=True
+        )
+        parser.add_argument(
+            '--metadata-file',
+            help=u'Path to a file containing MARC or ONIX 3.0 metadata for every title in the collection',
+            required=True
+        )
+        parser.add_argument(
+            '--metadata-format',
+            help=u'Format of the metadata file ("marc" or "onix")',
+            default='marc',
+        )
+        parser.add_argument(
+            '--cover-directory',
+            help=u'Directory containing a full-size cover image for every title in the collection.',
+        )
+        parser.add_argument(
+            '--ebook-directory',
+            help=u'Directory containing an EPUB or PDF file for every title in the collection.',
+            required=True
+        )
+        RS = RightsStatus
+        rights_uris = ", ".join(RS.OPEN_ACCESS)
+        parser.add_argument(
+            '--rights-uri',
+            help=u"A URI explaining the rights status of the works being uploaded. Acceptable values: %s" % rights_uris,
+            required=True
+        )
+        parser.add_argument(
+            '--dry-run',
+            help=u"Show what would be imported, but don't actually do the import.",
+            action='store_true',
+        )
+        return parser
+
+    def do_run(self, cmd_args=None):
+        parser = self.arg_parser(self._db)
+        parsed = parser.parse_args(cmd_args)
+        collection_name = parsed.collection_name
+        data_source_name = parsed.data_source_name
+        metadata_file = parsed.metadata_file
+        metadata_format = parsed.metadata_format
+        cover_directory = parsed.cover_directory
+        ebook_directory = parsed.ebook_directory
+        rights_uri = parsed.rights_uri
+        dry_run = parsed.dry_run
+        return self.run_with_arguments(
+            collection_name, data_source_name,
+            metadata_file, metadata_format, cover_directory,
+            ebook_directory, rights_uri, dry_run
+        )
+
+    def run_with_arguments(
+            self, collection_name, data_source_name, metadata_file,
+            metadata_format, cover_directory, ebook_directory, rights_uri,
+            dry_run
+    ):
+        if dry_run:
+            self.log.warn(
+                "This is a dry run. No files will be uploaded and nothing will change in the database."
+            )
+        collection, mirror = self.load_collection(
+            collection_name, data_source_name
+        )
+
+        if dry_run:
+            mirror = None
+
+        replacement_policy = ReplacementPolicy.from_license_source(self._db)
+        replacement_policy.mirror = mirror
+        metadata_records = self.load_metadata(metadata_file, metadata_format, data_source_name)
+        for metadata in metadata_records:
+            self.work_from_metadata(
+                collection, metadata, replacement_policy, cover_directory,
+                ebook_directory, rights_uri
+            )
+            if not dry_run:
+                self._db.commit()
+
+    def load_collection(self, collection_name, data_source_name):
+        """Create or locate a Collection with the given name.
+
+        If the Collection needs to be created, it will be associated
+        with the given data source and (if configured) the site-wide
+        mirror configuration.
+
+        :param collection_name: Name of the Collection.
+        :param data_source_name: Associate this data source with
+            the Collection if it does not already have a data source.
+            A DataSource object will be created if necessary.
+
+        :return: A 2-tuple (Collection, MirrorUploader)
+        """
+        collection, is_new = Collection.by_name_and_protocol(
+            self._db, collection_name, ExternalIntegration.MANUAL
+        )
+
+        if is_new:
+            self.log.info("CREATED Collection for %s: %r" % (
+                    data_source_name, collection))
+            self.log.warn(
+                "The new Collection is not associated with any libraries; you must do this yourself through the admin interface."
+            )
+
+            data_source = DataSource.lookup(
+                self._db, data_source_name, autocreate=True,
+                offers_licenses=True
+            )
+            collection.external_integration.set_setting(
+                Collection.DATA_SOURCE_NAME_SETTING, data_source.name
+            )
+            self.log.info(
+                "Associated Collection %s with data source %s",
+                collection.name, data_source.name
+            )
+
+            try:
+                mirror_integration = MirrorUploader.sitewide_integration(
+                    self._db
+                )
+            except CannotLoadConfiguration, e:
+                # There is no sitewide mirror configuration, or else
+                # there is more than one. Either way, we can't
+                # associate a mirror integration with the new collection.
+                mirror_integration = None
+
+            if mirror_integration:
+                collection.mirror_integration = mirror_integration
+                self.log.info(
+                    "Associated Collection %s with the sitewide storage integration.",
+                    collection.name
+                )
+        mirror = MirrorUploader.for_collection(collection)
+        return collection, mirror
+
+    def load_metadata(self, metadata_file, metadata_format, data_source_name):
+        """Read a metadata file and convert the data into Metadata records."""
+        metadata_records = []
+
+        if metadata_format == 'marc':
+            extractor = MARCExtractor()
+        elif metadata_format == 'onix':
+            extractor = ONIXExtractor()
+
+        with open(metadata_file) as f:
+            metadata_records.extend(extractor.parse(f, data_source_name))
+        return metadata_records
+
+    def work_from_metadata(self, collection, metadata, policy, *args, **kwargs):
+        self.annotate_metadata(metadata, policy, *args, **kwargs)
+
+        if not metadata.circulation:
+            # We cannot actually provide access to the book so there
+            # is no point in proceeding with the import.
+            return
+
+        edition, new = metadata.edition(self._db)
+        metadata.apply(edition, collection, replace=policy)
+        data_source = metadata.data_source(self._db)
+        [pool] = [x for x in edition.license_pools
+                  if x.data_source == data_source]
+        if new:
+            self.log.info("Created new edition for %s", edition.title)
+        else:
+            self.log.info("Updating existing edition for %s", edition.title)
+
+        work, ignore = pool.calculate_work(even_if_no_author=True)
+        if work:
+            work.set_presentation_ready()
+            self.log.info(
+                "FINALIZED %s/%s/%s" % (work.title, work.author, work.sort_author)
+            )
+        return work
+
+
+    def annotate_metadata(self, metadata, policy,
+                          cover_directory, ebook_directory, rights_uri):
+        """Add a CirculationData and possibly an extra LinkData
+        to `metadata`.
+        """
+        identifier, ignore = metadata.primary_identifier.load(self._db)
+        data_source = metadata.data_source(self._db)
+        mirror = policy.mirror
+
+        circulation_data = self.load_circulation_data(
+            identifier, data_source, ebook_directory, mirror,
+            metadata.title, rights_uri
+        )
+        if not circulation_data:
+            # There is no point in contining.
+            return
+        metadata.circulation = circulation_data
+
+        # If a cover image is available, add it to the Metadata
+        # as a link.
+        cover_link = None
+        if cover_directory:
+            cover_link = self.load_cover_link(
+                identifier, data_source, cover_directory, mirror
+            )
+        if cover_link:
+            metadata.links.append(cover_link)
+        else:
+            logging.info(
+                "Proceeding with import even though %r has no cover.",
+                identifier
+            )
+
+    def load_circulation_data(self, identifier, data_source, ebook_directory,
+                              mirror, title, rights_uri):
+        """Load an actual copy of a book from disk.
+
+        :return: A CirculationData that contains the book as an open-access
+        download, or None if no such book can be found.
+        """
+        ignore, book_media_type, book_content = self._locate_file(
+            identifier.identifier, ebook_directory,
+            Representation.COMMON_EBOOK_EXTENSIONS,
+            "ebook file",
+        )
+        if not book_content:
+            # We couldn't find an actual copy of the book, so there is
+            # no point in proceeding.
+            return
+
+        if mirror:
+            book_url = mirror.book_url(
+                identifier,
+                '.' + Representation.FILE_EXTENSIONS[book_media_type],
+                data_source=data_source,
+                title=title
+            )
+        else:
+            # This is a dry run and we won't be mirroring anything.
+            book_url = identifier.identifier + "." + Representation.FILE_EXTENSIONS[book_media_type]
+
+        book_link = LinkData(
+            rel=Hyperlink.OPEN_ACCESS_DOWNLOAD,
+            href=book_url,
+            media_type=book_media_type,
+            content=book_content
+        )
+        formats = [
+            FormatData(
+                content_type=book_media_type,
+                drm_scheme=DeliveryMechanism.NO_DRM,
+                link=book_link,
+            )
+        ]
+        circulation_data = CirculationData(
+            data_source=data_source.name,
+            primary_identifier=identifier,
+            links=[book_link],
+            formats=formats,
+            default_rights_uri=rights_uri,
+        )
+        return circulation_data
+
+    def load_cover_link(self, identifier, data_source, cover_directory, mirror):
+       """Load an actual book cover from disk.
+
+       :return: A LinkData containing a cover of the book, or None
+       if no book cover can be found.
+       """
+       cover_filename, cover_media_type, cover_content = self._locate_file(
+           identifier.identifier, cover_directory,
+           Representation.COMMON_IMAGE_EXTENSIONS, "cover image"
+       )
+
+       if not cover_content:
+           return None
+       cover_filename = (
+           identifier.identifier
+           + '.' + Representation.FILE_EXTENSIONS[cover_media_type]
+       )
+
+       if mirror:
+           cover_url = mirror.cover_image_url(
+               data_source, identifier, cover_filename
+           )
+       else:
+           # This is a dry run and we won't be mirroring anything.
+           cover_url = cover_filename
+
+       cover_link = LinkData(
+           rel=Hyperlink.IMAGE,
+           href=cover_url,
+           media_type=cover_media_type,
+           content=cover_content,
+       )
+       return cover_link
+
+    @classmethod
+    def _locate_file(cls, base_filename, directory, extensions,
+                     file_type="file", mock_filesystem_operations=None):
+        """Find an acceptable file in the given directory.
+
+        :param base_filename: A string to be used as the base of the filename.
+
+        :param directory: Look for a file in this directory.
+
+        :param extensions: Any of these extensions for the file is
+        acceptable.
+
+        :param file_type: Human-readable description of the type of
+        file we're looking for. This is used only in a log warning if
+        no file can be found.
+
+        :param mock_filesystem_operations: A test may pass in a
+        2-tuple of functions to replace os.path.exists and the 'open'
+        function.
+
+        :return: A 3-tuple. (None, None, None) if no file can be
+        found; otherwise (filename, media_type, contents).
+        """
+        if mock_filesystem_operations:
+            exists_f, open_f = mock_filesystem_operations
+        else:
+            exists_f = os.path.exists
+            open_f = open
+
+        success_path = None
+        media_type = None
+        attempts = []
+        for extension in extensions:
+            for ext in (extension, extension.upper()):
+                if not ext.startswith('.'):
+                    ext = '.' + ext
+                filename = base_filename + ext
+                path = os.path.join(directory, filename)
+                attempts.append(path)
+                if exists_f(path):
+                    media_type = Representation.MEDIA_TYPE_FOR_EXTENSION.get(
+                        ext.lower()
+                    )
+                    content = None
+                    with open_f(path) as fh:
+                        content = fh.read()
+                    return filename, media_type, content
+
+        # If we went through that whole loop without returning,
+        # we have failed.
+        logging.warn(
+            "Could not find %s for %s. Looked in: %s",
+            file_type, base_filename, ", ".join(attempts)
+        )
+        return None, None, None
+
 
 class LaneResetScript(LibraryInputScript):
     """Reset a library's lanes based on language configuration or estimates
@@ -1056,6 +1452,21 @@ You'll get another chance to back out before the database session is committed."
     def process_library(self, library):
         create_default_lanes(self._db, library)
 
+class NovelistSnapshotScript(LibraryInputScript):
+
+    def do_run(self, output=sys.stdout, *args, **kwargs):
+        parsed = self.parse_command_line(self._db, *args, **kwargs)
+        api = NoveListAPI.from_config(parsed.libraries[0])
+        if (api):
+            response = api.put_items_novelist(parsed.libraries[0])
+
+            if (response):
+                result = "NoveList Snapshot"
+                result += "\nRecords sent: " + str(response["RecordsReceived"])
+                result += "\nInvalid Records: " + str(response["InvalidRecords"]) + "\n"
+
+                output.write(result)
+
 class ODLBibliographicImportScript(OPDSImportScript):
     """Import bibliographic information from the feed associated
     with an ODL collection."""
@@ -1063,3 +1474,8 @@ class ODLBibliographicImportScript(OPDSImportScript):
     IMPORTER_CLASS = ODLBibliographicImporter
     MONITOR_CLASS = ODLBibliographicImportMonitor
     PROTOCOL = ODLBibliographicImporter.NAME
+
+class SharedODLImportScript(OPDSImportScript):
+    IMPORTER_CLASS = SharedODLImporter
+    MONITOR_CLASS = SharedODLImportMonitor
+    PROTOCOL = SharedODLImporter.NAME

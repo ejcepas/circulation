@@ -57,9 +57,13 @@ from circulation import (
     BaseCirculationAPI
 )
 from circulation_exceptions import *
+from selftest import (
+    HasSelfTests,
+    SelfTestResult,
+)
 
 
-class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI):
+class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI, HasSelfTests):
 
     NAME = ExternalIntegration.AXIS_360
     SETTINGS = [
@@ -90,6 +94,43 @@ class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI):
         (pdf, no_drm): 'PDF',
         (pdf, adobe_drm): 'PDF',
     }
+
+    def external_integration(self, _db):
+        return self.collection.external_integration
+
+    def _run_self_tests(self, _db):
+        result = self.run_test(
+            "Refreshing bearer token", self.refresh_bearer_token
+        )
+        yield result
+        if not result.success:
+            # If we can't get a bearer token, there's no point running
+            # the rest of the tests.
+            return
+
+        def _count_events():
+            now = datetime.utcnow()
+            five_minutes_ago = now - timedelta(minutes=5)
+            count = len(list(self.recent_activity(since=five_minutes_ago)))
+            return "Found %d event(s)" % count
+
+        yield self.run_test(
+            "Asking for circulation events for the last five minutes",
+            _count_events
+        )
+
+        for result in self.default_patrons(self.collection):
+            if isinstance(result, SelfTestResult):
+                yield result
+                continue
+            library, patron, pin = result
+            def _count_activity():
+                result = self.patron_activity(patron, pin)
+                return "Found %d loans/holds" % len(result)
+            yield self.run_test(
+                "Checking activity for test patron for library %s" % library.name,
+                _count_activity
+            )
 
     def checkout(self, patron, pin, licensepool, internal_format):
 
@@ -199,45 +240,71 @@ class Axis360API(BaseAxis360API, Authenticator, BaseCirculationAPI):
         The book's LicensePool will be updated with current
         circulation information.
         """
-        identifier_strings = self.create_identifier_strings(identifiers)
-        response = self.availability(title_ids=identifier_strings)
-        collection = self.collection
-        parser = BibliographicParser(collection)
         remainder = set(identifiers)
-        for bibliographic, availability in parser.process_all(response.content):
+        for bibliographic, availability in self._fetch_remote_availability(identifiers):
             identifier, is_new = bibliographic.primary_identifier.load(self._db)
             if identifier in remainder:
                 remainder.remove(identifier)
-            pool, is_new = availability.license_pool(self._db, collection)
+            pool, is_new = availability.license_pool(self._db, self.collection)
             availability.apply(self._db, pool.collection)
 
         # We asked Axis about n books. It sent us n-k responses. Those
         # k books are the identifiers in `remainder`. These books have
         # been removed from the collection without us being notified.
         for removed_identifier in remainder:
-            pool = identifier.licensed_through_collection(self.collection)
-            if not pool:
-                self.log.warn(
-                    "Was about to reap %r but no local license pool in this collection.",
-                    removed_identifier
-                )
-                continue
-            if pool.licenses_owned == 0:
-                # Already reaped.
-                continue
-            self.log.info(
-                "Reaping %r", removed_identifier
-            )
+            self._reap(removed_identifier)
 
-            availability = CirculationData(
-                data_source=pool.data_source,
-                primary_identifier=removed_identifier,
-                licenses_owned=0,
-                licenses_available=0,
-                licenses_reserved=0,
-                patrons_in_hold_queue=0,
+    def _fetch_remote_availability(self, identifiers):
+        """Retrieve availability information for the specified identifiers.
+
+        :yield: A stream of (Metadata, CirculationData) 2-tuples.
+        """
+        identifier_strings = self.create_identifier_strings(identifiers)
+        response = self.availability(title_ids=identifier_strings)
+        parser = BibliographicParser(self.collection)
+        return parser.process_all(response.content)
+
+    def _reap(self, identifier):
+        """Update our local circulation information to reflect the fact that
+        the identified book has been removed from the remote
+        collection.
+        """
+        collection = self.collection
+        pool = identifier.licensed_through_collection(collection)
+        if not pool:
+            self.log.warn(
+                "Was about to reap %r but no local license pool in this collection.",
+                identifier
             )
-            availability.apply(pool, ReplacementPolicy.from_license_source(self._db))
+            return
+        if pool.licenses_owned == 0:
+            # Already reaped.
+            return
+        self.log.info("Reaping %r", identifier)
+
+        availability = CirculationData(
+            data_source=pool.data_source,
+            primary_identifier=identifier,
+            licenses_owned=0,
+            licenses_available=0,
+            licenses_reserved=0,
+            patrons_in_hold_queue=0,
+        )
+        availability.apply(
+            self._db, collection,
+            ReplacementPolicy.from_license_source(self._db)
+        )
+
+    def recent_activity(self, since):
+        """Find books that have had recent activity.
+
+        :yield: A sequence of (Metadata, CirculationData) 2-tuples
+        """
+        availability = self.availability(since=since)
+        content = availability.content
+        for bibliographic, circulation in BibliographicParser(self.collection).process_all(
+                content):
+            yield bibliographic, circulation
 
 
 class Axis360CirculationMonitor(CollectionMonitor):
@@ -271,12 +338,8 @@ class Axis360CirculationMonitor(CollectionMonitor):
         # Give us five minutes of overlap because it's very important
         # we don't miss anything.
         since = start-self.FIVE_MINUTES
-        availability = self.api.availability(since=since)
-        status_code = availability.status_code
-        content = availability.content
         count = 0
-        for bibliographic, circulation in BibliographicParser(self.collection).process_all(
-                content):
+        for bibliographic, circulation in self.api.recent_activity(since):
             self.process_book(bibliographic, circulation)
             count += 1
             if count % self.batch_size == 0:
@@ -372,7 +435,7 @@ class ResponseParser(Axis360Parser):
         3108 : InvalidInputException, # DRM Credentials Required
         3109 : InvalidInputException, # Hold already exists or hold does not exist, depending.
         3110 : AlreadyCheckedOut,
-        3111 : CouldCheckOut,
+        3111 : CurrentlyAvailable,
         3112 : CannotFulfill,
         3113 : CannotLoan,
         (3113, "Title ID is not available for checkout") : NoAvailableCopies,

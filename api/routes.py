@@ -35,7 +35,7 @@ from flask_babel import lazy_gettext as _
 #  https://github.com/pallets/flask/issues/879
 #
 @app.before_first_request
-def initialize_circulation_manager(): 
+def initialize_circulation_manager():
     if os.environ.get('AUTOINITIALIZE') == "False":
         # It's the responsibility of the importing code to set app.manager
         # appropriately.
@@ -52,7 +52,7 @@ def monkeypatch_try_trigger_before_first_request_functions(self):
     """Called before each request and will ensure that it triggers
     the :attr:`before_first_request_funcs` and only exactly once per
     application instance (which means process usually).
-    
+
     :internal:
     """
     if self._got_first_request:
@@ -61,7 +61,7 @@ def monkeypatch_try_trigger_before_first_request_functions(self):
         if self._got_first_request:
             return
         for func in self.before_first_request_funcs:
-            func() 
+            func()
         self._got_first_request = True
 
 from flask import Flask
@@ -74,8 +74,8 @@ def get_locale():
 
 @app.teardown_request
 def shutdown_session(exception):
-    if (hasattr(app, 'manager') 
-        and hasattr(app.manager, '_db') 
+    if (hasattr(app, 'manager')
+        and hasattr(app.manager, '_db')
         and app.manager._db
     ):
         if exception:
@@ -189,7 +189,7 @@ def library_dir_route(path, *args, **kwargs):
         return default_library_no_slash
     return decorator
 
-@library_route("/")
+@library_route("/", strict_slashes=False)
 @has_library
 @allows_patron_web
 @returns_problem_detail
@@ -222,6 +222,70 @@ def acquisition_groups(lane_identifier):
 @returns_problem_detail
 def feed(lane_identifier):
     return app.manager.opds_feeds.feed(lane_identifier)
+
+@library_route('/crawlable')
+@has_library
+@allows_patron_web
+@returns_problem_detail
+def crawlable_library_feed():
+    return app.manager.opds_feeds.crawlable_library_feed()
+
+@library_route('/lists/<list_name>/crawlable')
+@has_library
+@allows_patron_web
+@returns_problem_detail
+def crawlable_list_feed(list_name):
+    return app.manager.opds_feeds.crawlable_list_feed(list_name)
+
+@app.route('/collections/<collection_name>/crawlable')
+@allows_patron_web
+@returns_problem_detail
+def crawlable_collection_feed(collection_name):
+    return app.manager.opds_feeds.crawlable_collection_feed(collection_name)
+
+@app.route("/collections/<collection_name>")
+@returns_problem_detail
+def shared_collection_info(collection_name):
+    return app.manager.shared_collection_controller.info(collection_name)
+
+@app.route("/collections/<collection_name>/register", methods=["POST"])
+@returns_problem_detail
+def shared_collection_register(collection_name):
+    return app.manager.shared_collection_controller.register(collection_name)
+
+@app.route("/collections/<collection_name>/<identifier_type>/<path:identifier>/borrow",
+           methods=['GET', 'POST'], defaults=dict(hold_id=None))
+@app.route("/collections/<collection_name>/holds/<hold_id>/borrow",
+           methods=['GET', 'POST'], defaults=dict(identifier_type=None, identifier=None))
+@returns_problem_detail
+def shared_collection_borrow(collection_name, identifier_type, identifier, hold_id):
+    return app.manager.shared_collection_controller.borrow(collection_name, identifier_type, identifier, hold_id)
+
+@app.route("/collections/<collection_name>/loans/<loan_id>")
+@returns_problem_detail
+def shared_collection_loan_info(collection_name, loan_id):
+    return app.manager.shared_collection_controller.loan_info(collection_name, loan_id)
+
+@app.route("/collections/<collection_name>/loans/<loan_id>/revoke")
+@returns_problem_detail
+def shared_collection_revoke_loan(collection_name, loan_id):
+    return app.manager.shared_collection_controller.revoke_loan(collection_name, loan_id)
+
+@app.route("/collections/<collection_name>/loans/<loan_id>/fulfill", defaults=dict(mechanism_id=None))
+@app.route("/collections/<collection_name>/loans/<loan_id>/fulfill/<mechanism_id>")
+@returns_problem_detail
+def shared_collection_fulfill(collection_name, loan_id, mechanism_id):
+    return app.manager.shared_collection_controller.fulfill(collection_name, loan_id, mechanism_id)
+
+@app.route("/collections/<collection_name>/holds/<hold_id>")
+@returns_problem_detail
+def shared_collection_hold_info(collection_name, hold_id):
+    return app.manager.shared_collection_controller.hold_info(collection_name, hold_id)
+
+@app.route("/collections/<collection_name>/holds/<hold_id>/revoke")
+@returns_problem_detail
+def shared_collection_revoke_hold(collection_name, hold_id):
+    return app.manager.shared_collection_controller.revoke_hold(collection_name, hold_id)
 
 @library_dir_route('/search', defaults=dict(lane_identifier=None))
 @library_route('/search/<lane_identifier>')
@@ -272,7 +336,7 @@ def annotations_for_work(identifier_type, identifier):
     return app.manager.annotations.container_for_work(identifier_type, identifier)
 
 @library_route('/works/<identifier_type>/<path:identifier>/borrow', methods=['GET', 'PUT'])
-@library_route('/works/<identifier_type>/<path:identifier>/borrow/<mechanism_id>', 
+@library_route('/works/<identifier_type>/<path:identifier>/borrow/<mechanism_id>',
            methods=['GET', 'PUT'])
 @has_library
 @allows_patron_web
@@ -285,7 +349,6 @@ def borrow(identifier_type, identifier, mechanism_id=None):
 @library_route('/works/<license_pool_id>/fulfill/<mechanism_id>')
 @has_library
 @allows_patron_web
-@requires_auth
 @returns_problem_detail
 def fulfill(license_pool_id, mechanism_id=None):
     return app.manager.loans.fulfill(license_pool_id, mechanism_id)
@@ -409,7 +472,7 @@ def adobe_drm_devices():
 @returns_problem_detail
 def adobe_drm_device(device_id):
     return app.manager.adobe_device_management.device_id_handler(device_id)
-    
+
 # Route that redirects to the authentication URL for an OAuth provider
 @library_route('/oauth_authenticate')
 @has_library

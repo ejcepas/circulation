@@ -26,6 +26,7 @@ from core.model import (
     get_one_or_create,
 )
 from core.metadata_layer import FormatData
+from core.selftest import HasSelfTests
 from circulation import (
     BaseCirculationAPI,
     LoanInfo,
@@ -36,13 +37,14 @@ from core.testing import (
     DatabaseTest,
     MockRequestsResponse,
 )
+from config import IntegrationException
 from circulation_exceptions import *
 
-class OPDSForDistributorsAPI(BaseCirculationAPI):
+class OPDSForDistributorsAPI(BaseCirculationAPI, HasSelfTests):
     NAME = "OPDS for Distributors"
     DESCRIPTION = _("Import books from a distributor that requires authentication to get the OPDS feed and download books.")
 
-    SETTINGS = OPDSImporter.SETTINGS + [
+    SETTINGS = OPDSImporter.BASE_SETTINGS + [
         {
             "key": ExternalIntegration.USERNAME,
             "label": _("Library's username or access key"),
@@ -61,11 +63,22 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
 
     def __init__(self, _db, collection):
         self.collection_id = collection.id
+        self.external_integration_id = collection.external_integration.id
         self.data_source_name = collection.external_integration.setting(Collection.DATA_SOURCE_NAME_SETTING).value
         self.username = collection.external_integration.username
         self.password = collection.external_integration.password
         self.feed_url = collection.external_account_id
         self.auth_url = None
+
+    def external_integration(self, _db):
+        return get_one(_db, ExternalIntegration,
+                       id=self.external_integration_id)
+
+    def _run_self_tests(self, _db):
+        """Try to get a token."""
+        yield self.run_test(
+            "Negotiate a fulfillment token", self._get_token, _db
+        )
 
     def _request_with_timeout(self, method, url, *args, **kwargs):
         """Wrapper around HTTP.request_with_timeout to be overridden for tests."""
@@ -76,7 +89,10 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
         # need to find the authenticate url in the OPDS
         # authentication document.
         if not self.auth_url:
-            response = self._request_with_timeout('GET', self.feed_url)
+            # Keep track of the most recent URL we retrieved for error
+            # reporting purposes.
+            current_url = self.feed_url
+            response = self._request_with_timeout('GET', current_url)
 
             if response.status_code != 401:
                 # This feed doesn't require authentication, so
@@ -85,24 +101,24 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
                 links = feed.get('feed', {}).get('links', [])
                 auth_doc_links = [l for l in links if l['rel'] == "http://opds-spec.org/auth/document"]
                 if not auth_doc_links:
-                    raise LibraryAuthorizationFailedException()
-                auth_doc_link = auth_doc_links[0].get("href")
+                    raise LibraryAuthorizationFailedException("No authentication document link found in %s" % current_url)
+                current_url = auth_doc_links[0].get("href")
 
-                response = self._request_with_timeout('GET', auth_doc_link)
+                response = self._request_with_timeout('GET', current_url)
 
             try:
                 auth_doc = json.loads(response.content)
             except Exception, e:
-                raise LibraryAuthorizationFailedException()
+                raise LibraryAuthorizationFailedException("Could not load authentication document from %s" % current_url)
             auth_types = auth_doc.get('authentication', [])
             credentials_types = [t for t in auth_types if t['type'] == "http://opds-spec.org/auth/oauth/client_credentials"]
             if not credentials_types:
-                raise LibraryAuthorizationFailedException()
+                raise LibraryAuthorizationFailedException("Could not find any credential-based authentication mechanisms in %s" % current_url)
 
             links = credentials_types[0].get('links', [])
             auth_links = [l for l in links if l.get("rel") == "authenticate"]
             if not auth_links:
-                raise LibraryAuthorizationFailedException()
+                raise LibraryAuthorizationFailedException("Could not find any authentication links in %s" % current_url)
             self.auth_url = auth_links[0].get("href")
 
         def refresh(credential):
@@ -116,7 +132,11 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
             access_token = token.get("access_token")
             expires_in = token.get("expires_in")
             if not access_token or not expires_in:
-                raise LibraryAuthorizationFailedException()
+                raise LibraryAuthorizationFailedException(
+                    "Document retrieved from %s is not a bearer token: %s" % (
+                        self.auth_url, token_response.content
+                    )
+                )
             credential.credential = access_token
             expires_in = expires_in
             # We'll avoid edge cases by assuming the token expires 75%
@@ -127,6 +147,25 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
                                  patron=None,
                                  refresher_method=refresh,
                                  )
+
+    def can_fulfill_without_loan(self, patron, licensepool, lpdm):
+        """Since OPDS For Distributors delivers books to the library rather
+        than creating loans, any book can be fulfilled without
+        identifying the patron, assuming the library's policies
+        allow it.
+
+        Just to be safe, though, we require that the
+        DeliveryMechanism's drm_scheme be either 'no DRM' or 'bearer
+        token', since other DRM schemes require identifying a patron.
+        """
+        if not lpdm or not lpdm.delivery_mechanism:
+            return False
+        drm_scheme = lpdm.delivery_mechanism.drm_scheme
+        if drm_scheme in (
+            DeliveryMechanism.NO_DRM, DeliveryMechanism.BEARER_TOKEN
+        ):
+            return True
+        return False
 
     def checkin(self, patron, pin, licensepool):
         # Delete the patron's loan for this licensepool.
@@ -143,19 +182,18 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
             pass
 
     def checkout(self, patron, pin, licensepool, internal_format):
+        now = datetime.datetime.utcnow()
         return LoanInfo(
             licensepool.collection,
             licensepool.data_source.name,
             licensepool.identifier.type,
             licensepool.identifier.identifier,
-            start_date=datetime.datetime.now(),
+            start_date=now,
             end_date=None,
         )
 
     def fulfill(self, patron, pin, licensepool, internal_format):
-        # Download the book from the appropriate acquisition link and return its content.
-        # TODO: Implement https://github.com/NYPL-Simplified/Simplified/wiki/BearerTokenPropagation#advertising-bearer-token-propagation
-        # instead.
+        """Retrieve a bearer token that can be used to download the book."""
 
         links = licensepool.identifier.links
         # Find the acquisition link with the right media type.
@@ -166,7 +204,7 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
 
                 # Obtain a Credential with the information from our
                 # bearer token.
-                _db = Session.object_session(patron)
+                _db = Session.object_session(licensepool)
                 credential = self._get_token(_db)
 
                 # Build a application/vnd.librarysimplified.bearer-token
@@ -215,16 +253,19 @@ class OPDSForDistributorsAPI(BaseCirculationAPI):
 class OPDSForDistributorsImporter(OPDSImporter):
     NAME = OPDSForDistributorsAPI.NAME
 
-    def import_from_feed(self, feed, **kwargs):
-        editions, pools, works, failures = super(OPDSForDistributorsImporter, self).import_from_feed(feed, **kwargs)
-
-        # If we were able to import a pool, it means we have a license for it,
-        # and can distribute unlimited copies.
-        for pool in pools:
-            pool.licenses_owned = 1
-            pool.licenses_available = 1
-
-        return editions, pools, works, failures
+    def update_work_for_edition(self, *args, **kwargs):
+        """After importing a LicensePool, set its availability
+        appropriately. Books imported through OPDS For Distributors are
+        not open-access, but a library that can perform this import has
+        a license for the title and can distribute unlimited copies.
+        """
+        pool, work = super(
+            OPDSForDistributorsImporter, self).update_work_for_edition(
+                *args, **kwargs
+        )
+        pool.licenses_owned = 1
+        pool.licenses_available = 1
+        return pool, work
 
     @classmethod
     def _add_format_data(cls, circulation):

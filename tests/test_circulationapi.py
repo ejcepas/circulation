@@ -18,7 +18,9 @@ from datetime import (
 
 from api.circulation_exceptions import *
 from api.circulation import (
+    BaseCirculationAPI,
     CirculationAPI,
+    DeliveryMechanismInfo,
     FulfillmentInfo,
     LoanInfo,
     HoldInfo,
@@ -35,6 +37,7 @@ from core.model import (
     Identifier,
     Loan,
     Hold,
+    Representation,
     RightsStatus,
 )
 from core.mock_analytics_provider import MockAnalyticsProvider
@@ -209,7 +212,7 @@ class TestCirculationAPI(DatabaseTest):
         # This is the expected behavior in most cases--you tried to
         # renew the loan and failed because it's not time yet.
         self.remote.queue_checkout(CannotRenew())
-        assert_raises_regexp(CannotRenew, '^$', self.borrow)
+        assert_raises_regexp(CannotRenew, 'CannotRenew', self.borrow)
 
     def test_attempt_renew_with_local_loan_and_no_available_copies(self):
         """We have a local loan and a remote loan but the patron tried to
@@ -249,6 +252,25 @@ class TestCirculationAPI(DatabaseTest):
         self.remote.queue_hold(holdinfo)
 
         # As such, an attempt to renew our loan results in us actually
+        # placing a hold on the book.
+        loan, hold, is_new = self.borrow()
+        eq_(None, loan)
+        eq_(True, is_new)
+        eq_(self.pool, hold.license_pool)
+        eq_(self.patron, hold.patron)
+
+    def test_borrow_creates_hold_if_api_returns_hold_info(self):
+        # There are no available copies, but the remote API
+        # places a hold for us right away instead of raising
+        # an error.
+        holdinfo = HoldInfo(
+            self.pool.collection, self.pool.data_source,
+            self.identifier.type, self.identifier.identifier,
+            None, None, 10
+        )
+        self.remote.queue_checkout(holdinfo)
+
+        # As such, an attempt to borrow results in us actually
         # placing a hold on the book.
         loan, hold, is_new = self.borrow()
         eq_(None, loan)
@@ -387,6 +409,99 @@ class TestCirculationAPI(DatabaseTest):
         # so that we don't keep offering the book.
         eq_([self.pool], self.remote.availability_updated_for)
 
+    def test_borrow_loan_limit_reached(self):
+        # The loan limit is 1, and the patron has a previous loan.
+        self.patron.library.setting(Configuration.LOAN_LIMIT).value = 1
+        previous_loan_pool = self._licensepool(None)
+        previous_loan_pool.open_access = False
+        now = datetime.now()
+        previous_loan, ignore = previous_loan_pool.loan_to(self.patron, end=now + timedelta(days=2))
+
+        # If the patron tried to check out when they're at the loan limit,
+        # the API will try to place a hold instead, and catch the error.
+        self.remote.queue_hold(CurrentlyAvailable())
+        assert_raises(PatronLoanLimitReached, self.borrow)
+
+        # If we increase the limit, borrow succeeds.
+        self.patron.library.setting(Configuration.LOAN_LIMIT).value = 2
+        loaninfo = LoanInfo(
+            self.pool.collection, self.pool.data_source,
+            self.pool.identifier.type,
+            self.pool.identifier.identifier,
+            now, now + timedelta(seconds=3600),
+        )
+        self.remote.queue_checkout(loaninfo)
+        loan, hold, is_new = self.borrow()
+        assert loan != None
+
+        # An open access book can be borrowed even if the patron's at the limit.
+        open_access_pool = self._licensepool(None, with_open_access_download=True)
+
+        loan, hold, is_new = self.circulation.borrow(
+            self.patron, '1234', open_access_pool, self.delivery_mechanism
+        )
+        assert loan != None
+
+        # And that loan doesn't count towards the limit.
+        self.patron.library.setting(Configuration.LOAN_LIMIT).value = 3
+
+        pool2 = self._licensepool(None,
+            data_source_name=DataSource.BIBLIOTHECA,
+            collection=self.collection)
+        loaninfo = LoanInfo(
+            pool2.collection, pool2.data_source,
+            pool2.identifier.type,
+            pool2.identifier.identifier,
+            now, now + timedelta(seconds=3600),
+        )
+        self.remote.queue_checkout(loaninfo)
+        loan, hold, is_new = self.circulation.borrow(
+            self.patron, '1234', pool2, self.delivery_mechanism
+        )
+        assert loan != None
+
+        # A loan with no end date also doesn't count toward the limit.
+        previous_loan.end = None
+        pool3 = self._licensepool(None,
+            data_source_name=DataSource.BIBLIOTHECA,
+            collection=self.collection)
+        loaninfo = LoanInfo(
+            pool3.collection, pool3.data_source,
+            pool3.identifier.type,
+            pool3.identifier.identifier,
+            now, now + timedelta(seconds=3600),
+        )
+        self.remote.queue_checkout(loaninfo)
+        loan, hold, is_new = self.circulation.borrow(
+            self.patron, '1234', pool2, self.delivery_mechanism
+        )
+        assert loan != None
+
+    def test_borrow_hold_limit_reached(self):
+        # The hold limit is 1, and the patron has a previous hold.
+        self.patron.library.setting(Configuration.HOLD_LIMIT).value = 1
+        other_pool = self._licensepool(None)
+        other_pool.open_access = False
+        other_pool.on_hold_to(self.patron)
+
+        now = datetime.now()
+        holdinfo = HoldInfo(
+            self.pool.collection, self.pool.data_source,
+            self.pool.identifier.type,
+            self.pool.identifier.identifier,
+            now, now + timedelta(seconds=3600), 10
+        )
+        self.remote.queue_checkout(NoAvailableCopies())
+        self.remote.queue_hold(holdinfo)
+
+        assert_raises(PatronHoldLimitReached, self.borrow)
+
+        # If we increase the limit, borrow succeeds.
+        self.patron.library.setting(Configuration.HOLD_LIMIT).value = 2
+        self.remote.queue_checkout(NoAvailableCopies())
+        loan, hold, is_new = self.borrow()
+        assert hold != None
+
     def test_fulfill_open_access(self):
         # Here's an open-access title.
         self.pool.open_access = True
@@ -443,7 +558,7 @@ class TestCirculationAPI(DatabaseTest):
             self.pool, broken_lpdm
         )
         assert isinstance(result, FulfillmentInfo)
-        eq_(result.content_link, link.resource.url)
+        eq_(result.content_link, link.resource.representation.public_url)
         eq_(result.content_type, i_want_an_epub.content_type)
 
         # Now, if we try to call fulfill() with the broken
@@ -453,7 +568,7 @@ class TestCirculationAPI(DatabaseTest):
             self.patron, '1234', self.pool, broken_lpdm
         )
         assert isinstance(result, FulfillmentInfo)
-        eq_(result.content_link, link.resource.url)
+        eq_(result.content_link, link.resource.representation.public_url)
         eq_(result.content_type, i_want_an_epub.content_type)
         
         # We get the right result even if the code calling
@@ -464,7 +579,7 @@ class TestCirculationAPI(DatabaseTest):
             self.pool, broken_lpdm
         )
         assert isinstance(result, FulfillmentInfo)
-        eq_(result.content_link, link.resource.url)
+        eq_(result.content_link, link.resource.representation.public_url)
         eq_(result.content_type, i_want_an_epub.content_type)
 
         # If we change the working LPDM so that it serves a different
@@ -477,9 +592,8 @@ class TestCirculationAPI(DatabaseTest):
         working_lpdm.delivery_mechanism = irrelevant_delivery_mechanism
         assert_raises(FormatNotAvailable, self.circulation.fulfill_open_access,
                       self.pool, i_want_an_epub)
-        
-        
-    def test_fulfill_sends_analytics_event(self):
+
+    def test_fulfill(self):
         self.pool.loan_to(self.patron)
 
         fulfillment = self.pool.delivery_mechanisms[0]
@@ -497,6 +611,30 @@ class TestCirculationAPI(DatabaseTest):
         eq_(1, self.analytics.count)
         eq_(CirculationEvent.CM_FULFILL,
             self.analytics.event_type)
+
+    def test_fulfill_without_loan(self):
+        # By default, a title cannot be fulfilled unless there is an active
+        # loan for the title (tested above, in test_fulfill).
+        fulfillment = self.pool.delivery_mechanisms[0]
+        fulfillment.content = "Fulfilled."
+        fulfillment.content_link = None
+        self.remote.queue_fulfill(fulfillment)
+
+        def try_to_fulfill():
+            # Note that we're passing None for `patron`.
+            return self.circulation.fulfill(
+                None, '1234', self.pool, self.pool.delivery_mechanisms[0]
+            )
+
+        assert_raises(NoActiveLoan, try_to_fulfill)
+
+        # However, if CirculationAPI.can_fulfill_without_loan() says it's
+        # okay, the title will be fulfilled anyway.
+        def yes_we_can(*args, **kwargs):
+            return True
+        self.circulation.can_fulfill_without_loan = yes_we_can
+        result = try_to_fulfill()
+        eq_(fulfillment, result)
             
     def test_revoke_loan_sends_analytics_event(self):
         self.pool.loan_to(self.patron)
@@ -666,6 +804,34 @@ class TestCirculationAPI(DatabaseTest):
         eq_(self.TODAY, hold.start)
         eq_(self.IN_TWO_WEEKS, hold.end)
         eq_(0, hold.position)
+
+    def test_sync_bookshelf_applies_locked_delivery_mechanism_to_loan(self):
+
+        # By the time we hear about the patron's loan, they've already
+        # locked in an oddball delivery mechanism.
+        mechanism = DeliveryMechanismInfo(
+            Representation.TEXT_HTML_MEDIA_TYPE, DeliveryMechanism.NO_DRM
+        )
+        pool = self._licensepool(None)
+        self.circulation.add_remote_loan(
+            pool.collection, pool.data_source.name,
+            pool.identifier.type,
+            pool.identifier.identifier,
+            datetime.utcnow(),
+            None,
+            locked_to=mechanism
+        )
+        self.circulation.sync_bookshelf(self.patron, "1234")
+
+        # The oddball delivery mechanism is now associated with the loan...
+        [loan] = self.patron.loans
+        delivery = loan.fulfillment.delivery_mechanism
+        eq_(Representation.TEXT_HTML_MEDIA_TYPE, delivery.content_type)
+        eq_(DeliveryMechanism.NO_DRM, delivery.drm_scheme)
+
+        # ... and (once we commit) with the LicensePool.
+        self._db.commit()
+        assert loan.fulfillment in pool.delivery_mechanisms
         
     def test_patron_activity(self):
         # Get a CirculationAPI that doesn't mock out its API's patron activity.
@@ -689,7 +855,117 @@ class TestCirculationAPI(DatabaseTest):
         eq_(0, len(loans))
         eq_(0, len(holds))
         eq_(False, complete)        
+
+    def test_can_fulfill_without_loan(self):
+        """Can a title can be fulfilled without an active loan?  It depends on
+        the BaseCirculationAPI implementation for that title's colelction.
+        """
+        class Mock(BaseCirculationAPI):
+            def can_fulfill_without_loan(self, patron, pool, lpdm):
+                return "yep"
+
+        pool = self._licensepool(None)
+        circulation = CirculationAPI(self._db, self._default_library)
+        circulation.api_for_collection[pool.collection.id] = Mock()
+        eq_(
+            "yep",
+            circulation.can_fulfill_without_loan(None, pool, object())
+        )
+
+        # If format data is missing or the BaseCirculationAPI cannot
+        # be found, we assume the title cannot be fulfilled.
+        eq_(False, circulation.can_fulfill_without_loan(None, pool, None))
+        eq_(False, circulation.can_fulfill_without_loan(None, None, object()))
+
+        circulation.api_for_collection = {}
+        eq_(False, circulation.can_fulfill_without_loan(None, pool, None))
+
+        # An open access pool can be fulfilled even without the BaseCirculationAPI.
+        pool.open_access = True
+        eq_(True, circulation.can_fulfill_without_loan(None, pool, object()))
+
+class TestBaseCirculationAPI(object):
+
+    def test_can_fulfill_without_loan(self):
+        """By default, there is a blanket prohibition on fulfilling a title
+        when there is no active loan.
+        """
+        api = BaseCirculationAPI()
+        eq_(False, api.can_fulfill_without_loan(object(), object(), object()))
+
+
+class TestDeliveryMechanismInfo(DatabaseTest):
+
+    def test_apply(self):
+
+        # Here's a LicensePool with one non-open-access delivery mechanism.
+        pool = self._licensepool(None)
+        eq_(False, pool.open_access)
+        [mechanism] = [
+            lpdm.delivery_mechanism for lpdm in pool.delivery_mechanisms
+        ]
+        eq_(Representation.EPUB_MEDIA_TYPE, mechanism.content_type)
+        eq_(DeliveryMechanism.ADOBE_DRM, mechanism.drm_scheme)
+
+        # This patron has the book out on loan, but as far as we no,
+        # no delivery mechanism has been set.
+        patron = self._patron()
+        loan, ignore = pool.loan_to(patron)
+
+        # When consulting with the source of the loan, we learn that 
+        # the patron has locked the delivery mechanism to a previously
+        # unknown mechanism.
+        info = DeliveryMechanismInfo(
+            Representation.PDF_MEDIA_TYPE, DeliveryMechanism.NO_DRM
+        )
+        info.apply(loan)
+
+        # This results in the addition of a new delivery mechanism to
+        # the LicensePool.
+        [new_mechanism] = [
+            lpdm.delivery_mechanism for lpdm in pool.delivery_mechanisms
+            if lpdm.delivery_mechanism != mechanism
+        ]
+        eq_(Representation.PDF_MEDIA_TYPE, new_mechanism.content_type)
+        eq_(DeliveryMechanism.NO_DRM, new_mechanism.drm_scheme)
+        eq_(new_mechanism, loan.fulfillment.delivery_mechanism)
+        eq_(RightsStatus.IN_COPYRIGHT, loan.fulfillment.rights_status.uri)
+
+        # Calling apply() again with the same arguments does nothing.
+        info.apply(loan)
+        eq_(2, len(pool.delivery_mechanisms))
+
+        # Although it's extremely unlikely that this will happen in
+        # real life, it's possible for this operation to reveal a new
+        # *open-access* delivery mechanism for a LicensePool.
+        link, new = pool.identifier.add_link(
+            Hyperlink.OPEN_ACCESS_DOWNLOAD, self._url,
+            pool.data_source, Representation.EPUB_MEDIA_TYPE
+        )
+
+        info = DeliveryMechanismInfo(
+            Representation.EPUB_MEDIA_TYPE, DeliveryMechanism.NO_DRM,
+            RightsStatus.CC0, link.resource
+        )
+
+        # Calling apply() on the loan we were using before will update
+        # its associated LicensePoolDeliveryMechanism.
+        info.apply(loan)
+        [oa_lpdm] = [
+            lpdm for lpdm in pool.delivery_mechanisms
+            if lpdm.delivery_mechanism not in (mechanism, new_mechanism)
+        ]
+        eq_(oa_lpdm, loan.fulfillment)
         
+        # The correct resource and rights status have been associated
+        # with the new LicensePoolDeliveryMechanism.
+        eq_(RightsStatus.CC0, oa_lpdm.rights_status.uri)
+        eq_(link.resource, oa_lpdm.resource)
+
+        # The LicensePool is now considered an open-access LicensePool,
+        # since it has an open-access delivery mechanism.
+        eq_(True, pool.open_access)
+
 
 class TestConfigurationFailures(DatabaseTest):
 

@@ -12,7 +12,10 @@ from core.coverage import (
     WorkCoverageProvider,
 )
 from sqlalchemy import and_, func, or_
-from sqlalchemy.orm import contains_eager
+from sqlalchemy.orm import (
+    aliased,
+    contains_eager,
+)
 from core.model import (
     Collection,
     ConfigurationSetting,
@@ -242,7 +245,7 @@ class MetadataWranglerCollectionRegistrar(BaseMetadataWranglerCoverageProvider):
 
     Once it's registered, any future updates to the available metadata
     for a given Identifier will be detected by the
-    MetadataWranglerCollectionUpdateMonitor.
+    MWCollectionUpdateMonitor.
     """
 
     SERVICE_NAME = "Metadata Wrangler Collection Registrar"
@@ -339,27 +342,30 @@ class MetadataWranglerCollectionReaper(BaseMetadataWranglerCoverageProvider):
         This allows Identifiers to be added to the collection again via
         MetadataWranglerCoverageProvider lookup if a license is repurchased.
         """
-        qu = self._db.query(Identifier.id).join(Identifier.coverage_records)
-        reaper_covered = qu.filter(
-            CoverageRecord.data_source==self.data_source,
-            CoverageRecord.operation==CoverageRecord.REAP_OPERATION
-        )
-        wrangler_covered = qu.filter(
-            CoverageRecord.data_source==self.data_source,
-            CoverageRecord.operation==CoverageRecord.IMPORT_OPERATION
-        )
-        # Get the db ids of identifiers that have been both imported and reaped.
-        subquery = reaper_covered.intersect(wrangler_covered).subquery()
+        # Join CoverageRecord against an alias of itself to find all
+        # 'import' CoverageRecords that have been obviated by a
+        # 'reaper' coverage record for the same Identifier.
+        reaper_coverage = aliased(CoverageRecord)
+        qu = self._db.query(CoverageRecord).join(
+            reaper_coverage, 
+            CoverageRecord.identifier_id==reaper_coverage.identifier_id
 
-        # Retrieve the outdated import coverage record and delete it.
-        coverage_records = self._db.query(CoverageRecord).\
-                join(CoverageRecord.identifier).\
-                join(subquery, Identifier.id.in_(subquery)).\
-                filter(
-                    CoverageRecord.data_source==self.data_source,
-                    CoverageRecord.operation==CoverageRecord.IMPORT_OPERATION
-                )
-        for record in coverage_records.all():
+        # The CoverageRecords were selecting are 'import' records.
+        ).filter(
+            CoverageRecord.data_source==self.data_source
+        ).filter(
+            CoverageRecord.operation==CoverageRecord.IMPORT_OPERATION
+
+        # And we're only selecting them if there's also a 'reaper'
+        # coverage record.
+        ).filter(
+            reaper_coverage.data_source==self.data_source
+        ).filter(
+            reaper_coverage.operation==CoverageRecord.REAP_OPERATION
+        )
+
+        # Delete all 'import' CoverageRecords that have been reaped.
+        for record in qu:
             self._db.delete(record)
         super(MetadataWranglerCollectionReaper, self).finalize_batch()
 
@@ -372,19 +378,10 @@ class MetadataUploadCoverageProvider(BaseMetadataWranglerCoverageProvider):
     SERVICE_NAME = "Metadata Upload Coverage Provider"
     OPERATION = CoverageRecord.METADATA_UPLOAD_OPERATION
     DATA_SOURCE_NAME = DataSource.INTERNAL_PROCESSING
-       
-    def items_that_need_coverage(self, identifiers=None, **kwargs):
-        """Find all identifiers lacking coverage from this CoverageProvider.
-        Only identifiers that have CoverageRecords in the 'transient
-        failure' state will be returned. Unlike with other
-        CoverageProviders, Identifiers that have no CoverageRecord at
-        all will not be processed.
-        """
-        qu = super(MetadataUploadCoverageProvider, self).items_that_need_coverage(
-            identifiers=identifiers, **kwargs
-        )
-        qu = qu.filter(CoverageRecord.id != None)
-        return qu
+
+    def __init__(self, *args, **kwargs):
+        kwargs['registered_only'] = kwargs.get('registered_only', True)
+        super(MetadataUploadCoverageProvider, self).__init__(*args, **kwargs)
 
     def process_batch(self, batch):
         """Create an OPDS feed from a batch and upload it to the metadata client."""

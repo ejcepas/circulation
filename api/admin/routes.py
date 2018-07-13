@@ -46,11 +46,10 @@ def setup_admin(_db=None):
         _db, Configuration.SECRET_KEY
     )
 
-
 def allows_admin_auth_setup(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        setting_up = (app.manager.admin_sign_in_controller.auth == None)
+        setting_up = (app.manager.admin_sign_in_controller.admin_auth_providers == [])
         return f(*args, setting_up=setting_up, **kwargs)
     return decorated
 
@@ -110,7 +109,7 @@ def returns_json_or_response_or_problem_detail(f):
 def google_auth_callback():
     return app.manager.admin_sign_in_controller.redirect_after_google_sign_in()
 
-@app.route("/admin/sign_in_with_password", methods=["GET", "POST"])
+@app.route("/admin/sign_in_with_password", methods=["POST"])
 @returns_problem_detail
 def password_auth():
     return app.manager.admin_sign_in_controller.password_sign_in()
@@ -119,6 +118,18 @@ def password_auth():
 @returns_problem_detail
 def admin_sign_in():
     return app.manager.admin_sign_in_controller.sign_in()
+
+@app.route('/admin/sign_out')
+@returns_problem_detail
+@requires_admin
+def admin_sign_out():
+    return app.manager.admin_sign_in_controller.sign_out()
+
+@app.route('/admin/change_password', methods=["POST"])
+@returns_problem_detail
+@requires_admin
+def admin_change_password():
+    return app.manager.admin_sign_in_controller.change_password()
 
 @library_route('/admin/works/<identifier_type>/<path:identifier>', methods=['GET'])
 @has_library
@@ -134,12 +145,34 @@ def work_details(identifier_type, identifier):
 def work_classifications(identifier_type, identifier):
     return app.manager.admin_work_controller.classifications(identifier_type, identifier)
 
+@library_route('/admin/works/<identifier_type>/<path:identifier>/preview_book_cover', methods=['POST'])
+@has_library
+@returns_problem_detail
+@requires_admin
+def work_preview_book_cover(identifier_type, identifier):
+    return app.manager.admin_work_controller.preview_book_cover(identifier_type, identifier)
+
+@library_route('/admin/works/<identifier_type>/<path:identifier>/change_book_cover', methods=['POST'])
+@has_library
+@returns_problem_detail
+@requires_admin
+def work_change_book_cover(identifier_type, identifier):
+    return app.manager.admin_work_controller.change_book_cover(identifier_type, identifier)
+
 @library_route('/admin/works/<identifier_type>/<path:identifier>/complaints', methods=['GET'])
 @has_library
 @returns_json_or_response_or_problem_detail
 @requires_admin
 def work_complaints(identifier_type, identifier):
     return app.manager.admin_work_controller.complaints(identifier_type, identifier)
+
+@library_route('/admin/works/<identifier_type>/<path:identifier>/lists', methods=['GET', 'POST'])
+@has_library
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def work_custom_lists(identifier_type, identifier):
+    return app.manager.admin_work_controller.custom_lists(identifier_type, identifier)
 
 @library_route('/admin/works/<identifier_type>/<path:identifier>/edit', methods=['POST'])
 @has_library
@@ -188,6 +221,26 @@ def resolve_complaints(identifier_type, identifier):
 @requires_csrf_token
 def edit_classifications(identifier_type, identifier):
     return app.manager.admin_work_controller.edit_classifications(identifier_type, identifier)
+
+@app.route('/admin/roles')
+@returns_json_or_response_or_problem_detail
+def roles():
+    return app.manager.admin_work_controller.roles()
+
+@app.route('/admin/languages')
+@returns_json_or_response_or_problem_detail
+def languages():
+    return app.manager.admin_work_controller.languages()
+
+@app.route('/admin/media')
+@returns_json_or_response_or_problem_detail
+def media():
+    return app.manager.admin_work_controller.media()
+
+@app.route('/admin/rights_status')
+@returns_json_or_response_or_problem_detail
+def rights_status():
+    return app.manager.admin_work_controller.rights_status()
 
 @library_route('/admin/complaints')
 @has_library
@@ -301,9 +354,15 @@ def collections():
 def collection(collection_id):
     return app.manager.admin_settings_controller.collection(collection_id)
 
+@app.route("/admin/collection_library_registrations", methods=['GET', 'POST'])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def collection_library_registrations():
+    return app.manager.admin_settings_controller.collection_library_registrations()
+
 @app.route("/admin/admin_auth_services", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
-@allows_admin_auth_setup
 @requires_admin
 @requires_csrf_token
 def admin_auth_services():
@@ -401,6 +460,20 @@ def search_services():
 def search_service(service_id):
     return app.manager.admin_settings_controller.search_service(service_id)
 
+@app.route("/admin/storage_services", methods=["GET", "POST"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def storage_services():
+    return app.manager.admin_settings_controller.storage_services()
+
+@app.route("/admin/storage_service/<service_id>", methods=["DELETE"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def storage_service(service_id):
+    return app.manager.admin_settings_controller.storage_service(service_id)
+
 @app.route("/admin/discovery_services", methods=["GET", "POST"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
@@ -429,12 +502,26 @@ def sitewide_settings():
 def sitewide_setting(key):
     return app.manager.admin_settings_controller.sitewide_setting(key)
 
-@app.route("/admin/library_registrations", methods=['GET', 'POST'])
+@app.route("/admin/logging_services", methods=['GET', 'POST'])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
-def library_registrations():
-    return app.manager.admin_settings_controller.library_registrations()
+def logging_services():
+    return app.manager.admin_settings_controller.logging_services()
+
+@app.route("/admin/logging_service/<key>", methods=["DELETE"])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def logging_service(key):
+    return app.manager.admin_settings_controller.logging_service(key)
+
+@app.route("/admin/discovery_service_library_registrations", methods=['GET', 'POST'])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def discovery_service_library_registrations():
+    return app.manager.admin_settings_controller.discovery_service_library_registrations()
 
 @library_route("/admin/custom_lists", methods=["GET", "POST"])
 @has_library
@@ -444,7 +531,7 @@ def library_registrations():
 def custom_lists():
     return app.manager.admin_custom_lists_controller.custom_lists()
 
-@library_route("/admin/custom_list/<list_id>", methods=["DELETE"])
+@library_route("/admin/custom_list/<list_id>", methods=["GET", "POST", "DELETE"])
 @has_library
 @returns_json_or_response_or_problem_detail
 @requires_admin
@@ -511,8 +598,7 @@ def admin_sign_in_again():
         return redirect(app.manager.url_for('admin_sign_in', redirect=redirect_url))
     return flask.render_template_string(sign_in_again_template)
 
-@app.route('/admin/web')
-@app.route('/admin/web/')
+@app.route('/admin/web/', strict_slashes=False)
 @app.route('/admin/web/collection/<path:collection>/book/<path:book>')
 @app.route('/admin/web/collection/<path:collection>')
 @app.route('/admin/web/book/<path:book>')
@@ -520,8 +606,7 @@ def admin_sign_in_again():
 def admin_view(collection=None, book=None, etc=None, **kwargs):
     return app.manager.admin_view_controller(collection, book, path=etc)
 
-@app.route('/admin')
-@app.route('/admin/')
+@app.route('/admin/', strict_slashes=False)
 def admin_base(**kwargs):
     return redirect(app.manager.url_for('admin_view'))
 

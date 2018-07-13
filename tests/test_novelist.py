@@ -23,6 +23,10 @@ from api.novelist import (
     NoveListAPI,
     NoveListCoverageProvider,
 )
+from core.util.http import (
+    HTTP
+)
+from core.testing import MockRequestsResponse
 
 
 class TestNoveListAPI(DatabaseTest):
@@ -33,7 +37,7 @@ class TestNoveListAPI(DatabaseTest):
         self.integration = self._external_integration(
             ExternalIntegration.NOVELIST,
             ExternalIntegration.METADATA_GOAL, username=u'library',
-            password=u'yep', libraries=[self._default_library]
+            password=u'yep', libraries=[self._default_library],
         )
         self.novelist = NoveListAPI.from_config(self._default_library)
 
@@ -352,6 +356,137 @@ class TestNoveListAPI(DatabaseTest):
         eq_(True, isinstance(metadata, Metadata))
         eq_(0.67, round(confidence, 2))
         eq_(more_identifier, metadata.primary_identifier)
+
+    def test_get_items_from_query(self):
+        items = self.novelist.get_items_from_query(self._default_library)
+        eq_(items, [])
+
+        edition = self._edition(identifier_type=Identifier.ISBN)
+        pool = self._licensepool(edition, collection=self._default_collection)
+        contributor = self._contributor(sort_name=edition.sort_author, name=edition.author)
+
+        items = self.novelist.get_items_from_query(self._default_library)
+
+        item = dict(
+            Author=contributor[0]._sort_name,
+            Title=edition.title,
+            MediaType=self.novelist.medium_to_book_format_type_values.get(edition.medium, ""),
+            ISBN=edition.primary_identifier.identifier,
+            Narrator=""
+        )
+
+        eq_(items, [item])
+
+    def test_create_item_object(self):
+        (currentIdentifier, existingItem, newItem, addItem) = self.novelist.create_item_object(None, None, None)
+        eq_(currentIdentifier, None)
+        eq_(existingItem, None)
+        eq_(newItem, None)
+        eq_(addItem, False)
+
+        # Item row from the db query
+        # (identifier, identifier type, identifier,
+        # edition title, edition medium,
+        # contribution role, contributor sort name)
+        item_from_query = (
+            "12345", "Axis 360 ID", "23456",
+            "Title 1", "Book",
+            "Author", "Author 1")
+        second_item_from_query = (
+            "12345", "Axis 360 ID", "23456",
+            "Title 1", "Book",
+            "Primary Author", "Author 2")
+        (currentIdentifier, existingItem, newItem, addItem) = (
+            self.novelist.create_item_object(item_from_query, None, None)
+        )
+        eq_(currentIdentifier, item_from_query[2])
+        eq_(existingItem, None)
+        eq_(
+            newItem,
+            {"ISBN": "23456",
+            "MediaType": "EBook",
+            "Title": "Title 1",
+            "Role": "Author",
+            "Author": "Author 1",
+            "Narrator": ""}
+        )
+        eq_(addItem, True)
+
+        (currentIdentifier, existingItem, newItem, addItem) = (
+            self.novelist.create_item_object(second_item_from_query, second_item_from_query[2], newItem)
+        )
+        eq_(currentIdentifier, item_from_query[2])
+        eq_(existingItem,
+            {"ISBN": "23456",
+            "MediaType": "EBook",
+            "Title": "Title 1",
+            "Author": "Author 2",
+            "Role": "Primary Author",
+            "Narrator": ""}
+        )
+        eq_(newItem, None)
+        eq_(addItem, False)
+
+    def test_put_items_novelist(self):
+        response = self.novelist.put_items_novelist(self._default_library)
+
+        eq_(response, None)
+
+        edition = self._edition(identifier_type=Identifier.ISBN)
+        pool = self._licensepool(edition, collection=self._default_collection)
+        mock_response = {'Customer': 'NYPL', 'RecordsReceived': 10}
+
+        def mockHTTPPut(url, headers, **kwargs):
+            return MockRequestsResponse(200, content=json.dumps(mock_response))
+
+        oldPut = self.novelist.put
+        self.novelist.put = mockHTTPPut
+
+        response = self.novelist.put_items_novelist(self._default_library)
+
+        eq_(response, mock_response)
+
+        self.novelist.put = oldPut
+
+    def test_make_novelist_data_object(self):
+        bad_data = []
+        result = self.novelist.make_novelist_data_object(bad_data)
+
+        eq_(result, {
+            "Customer": "library:yep",
+            "Records": []
+        })
+
+        data = [
+            {"ISBN":"12345", "MediaType": "http://schema.org/EBook", "Title": "Book 1", "Author": "Author 1" },
+            {"ISBN":"12346", "MediaType": "http://schema.org/EBook", "Title": "Book 2", "Author": "Author 2" },
+        ]
+        result = self.novelist.make_novelist_data_object(data)
+
+        eq_(result, {
+            "Customer": "library:yep",
+            "Records": data
+        })
+
+    def mockHTTPPut(self, *args, **kwargs):
+        self.called_with = (args, kwargs)
+
+    def test_put(self):
+        oldPut = HTTP.put_with_timeout
+
+        HTTP.put_with_timeout = self.mockHTTPPut
+
+        headers = {"AuthorizedIdentifier": "authorized!"}
+        isbns = ["12345", "12346", "12347"]
+        data = self.novelist.make_novelist_data_object(isbns)
+
+        response = self.novelist.put("http://apiendpoint.com", headers, data=data)
+        (params, args) = self.called_with
+
+        eq_(params, ("http://apiendpoint.com", data))
+        eq_(args["headers"], headers)
+
+        HTTP.put_with_timeout = oldPut
 
 
 class TestNoveListCoverageProvider(DatabaseTest):

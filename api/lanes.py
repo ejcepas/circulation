@@ -1,5 +1,9 @@
 from nose.tools import set_trace
-from sqlalchemy import or_
+from sqlalchemy import (
+    and_,
+    func,
+    or_,
+)
 from sqlalchemy.orm import aliased
 from flask_babel import lazy_gettext as _
 import time
@@ -30,6 +34,7 @@ from core.model import (
     DataSource,
     Edition,
     ExternalIntegration,
+    Library,
     LicensePool,
     Session,
     Work,
@@ -51,25 +56,51 @@ def load_lanes(_db, library):
     Otherwise, a WorkList containing the visible top-level lanes is
     returned.
     """
+    top_level = WorkList.top_level_for_library(_db, library)
 
-    # Load all Lane objects from the database.
-    lanes = _db.query(Lane).filter(Lane.library==library).order_by(Lane.priority)
+    # It's likely this WorkList will be used across sessions, so
+    # expunge any data model objects from the database session.
+    if isinstance(top_level, Lane):
+        to_expunge = [top_level]
+    else:
+        to_expunge = [x for x in top_level.children if isinstance(x, Lane)]
 
-    # But only the visible top-level Lanes go into the WorkList.
-    top_level_lanes = [x for x in lanes if not x.parent and x.visible]
+    map(_db.expunge, to_expunge)
+    return top_level
 
-    # Expunge the Lanes from the database before they go into the WorkList,
-    # since it will be used across sessions.
-    map(_db.expunge, top_level_lanes)
 
-    if len(top_level_lanes) == 1:
-        return top_level_lanes[0]
+def _lane_configuration_from_collection_sizes(estimates):
+    """Sort a library's collections into 'large', 'small', and 'tiny'
+    subcollections based on language.
 
-    wl = WorkList()
-    wl.initialize(
-        library, display_name=_("Collection"), children=top_level_lanes
-    )
-    return wl
+    :param estimates: A Counter.
+
+    :return: A 3-tuple (large, small, tiny). 'large' will contain the
+    collection with the largest language, and any languages with a
+    collection more than 10% the size of the largest
+    collection. 'small' will contain any languages with a collection
+    more than 1% the size of the largest collection, and 'tiny' will
+    contain all other languages represented in `estimates`.
+    """
+    if not estimates:
+        # There are no holdings. Assume we have a large English
+        # collection and nothing else.
+        return [u'eng'], [], []
+
+    large = []
+    small = []
+    tiny = []
+
+    [(ignore, largest)] = estimates.most_common(1)
+    for language, count in estimates.most_common():
+        if count > largest * 0.1:
+            large.append(language)
+        elif count > largest * 0.01:
+            small.append(language)
+        else:
+            tiny.append(language)
+    return large, small, tiny
+
 
 def create_default_lanes(_db, library):
     """Reset the lanes for the given library to the default.
@@ -82,17 +113,18 @@ def create_default_lanes(_db, library):
     If an NYT integration is configured, there will also be a
     'Best Sellers' top-level lane.
 
-    The database will also have a top-level lane named after each
-    small-collection language. Each such sublane contains "Adult
-    Fiction", "Adult Nonfiction", and "Children/YA" sublanes.
-
-    Finally the database includes an "Other Languages" top-level lane
-    which covers all other languages known to the collection.
+    If there are any small- or tiny-collection languages, the database
+    will also have a top-level lane called 'World Languages'. The
+    'World Languages' lane will have a sublane for every small- and
+    tiny-collection languages. The small-collection languages will
+    have "Adult Fiction", "Adult Nonfiction", and "Children/YA"
+    sublanes; the tiny-collection languages will not have any sublanes.
 
     If run on a Library that already has Lane configuration, this can
     be an extremely destructive method. All new Lanes will be visible
     and all Lanes based on CustomLists (but not the CustomLists
     themselves) will be destroyed.
+
     """
     # Delete existing lanes.
     for lane in _db.query(Lane).filter(Lane.library_id==library.id):
@@ -100,33 +132,22 @@ def create_default_lanes(_db, library):
 
     top_level_lanes = []
 
+    # Hopefully this library is configured with explicit guidance as
+    # to how the languages should be set up.
     large = Configuration.large_collection_languages(library) or []
     small = Configuration.small_collection_languages(library) or []
     tiny = Configuration.tiny_collection_languages(library) or []
 
-    # If there are no language configuration settings, estimate the
-    # current collection size to determine the lanes.
+    # If there are no language configuration settings, we can estimate
+    # the current collection size to determine the lanes.
     if not large and not small and not tiny:
         estimates = library.estimated_holdings_by_language()
-        [(ignore, largest)] = estimates.most_common(1)
-        for language, count in estimates.most_common():
-            if count > largest * 0.1:
-                large.append(language)
-            elif count > largest * 0.01:
-                small.append(language)
-            else:
-                tiny.append(language)
-
+        large, small, tiny = _lane_configuration_from_collection_sizes(estimates)
     priority = 0
     for language in large:
         priority = create_lanes_for_large_collection(_db, library, language, priority=priority)
 
-    for language in small:
-        priority = create_lane_for_small_collection(_db, library, language, priority=priority)
-
-    other_languages_lane = create_lane_for_tiny_collections(
-        _db, library, tiny, priority=priority
-    )
+    create_world_languages_lane(_db, library, small, tiny, priority)
 
 def lane_from_genres(_db, library, genres, display_name=None,
                      exclude_genres=None, priority=0, audiences=None, **extra_args):
@@ -235,6 +256,13 @@ def create_lanes_for_large_collection(_db, library, languages, priority=0):
     YA = [Classifier.AUDIENCE_YOUNG_ADULT]
     CHILDREN = [Classifier.AUDIENCE_CHILDREN]
 
+    common_args = dict(
+        languages=languages,
+        media=None
+    )
+    adult_common_args = dict(common_args)
+    adult_common_args['audiences'] = ADULT
+
     include_best_sellers = False
     nyt_data_source = DataSource.lookup(_db, DataSource.NYT)
     nyt_integration = get_one(
@@ -253,16 +281,12 @@ def create_lanes_for_large_collection(_db, library, languages, priority=0):
             _db, Lane, library=library,
             display_name="Best Sellers",
             priority=priority,
-            languages=languages
+            **common_args
         )
         priority += 1
         best_sellers.list_datasource = nyt_data_source
         sublanes.append(best_sellers)
 
-    adult_common_args = dict(
-        languages=languages,
-        audiences=ADULT,
-    )
 
     adult_fiction_sublanes = []
     adult_fiction_priority = 0
@@ -343,10 +367,8 @@ def create_lanes_for_large_collection(_db, library, languages, priority=0):
     priority += 1
     sublanes.append(adult_nonfiction)
 
-    ya_common_args = dict(
-        audiences=YA,
-        languages=languages,
-    )
+    ya_common_args = dict(common_args)
+    ya_common_args['audiences'] = YA
 
     ya_fiction, ignore = create(
         _db, Lane, library=library,
@@ -456,10 +478,8 @@ def create_lanes_for_large_collection(_db, library, languages, priority=0):
     ya_nonfiction_priority += 1
 
 
-    children_common_args = dict(
-        audiences=CHILDREN,
-        languages=languages,
-    )
+    children_common_args = dict(common_args)
+    children_common_args['audiences'] = CHILDREN
 
     children, ignore = create(
         _db, Lane, library=library,
@@ -610,7 +630,55 @@ def create_lanes_for_large_collection(_db, library, languages, priority=0):
 
     return priority
 
-def create_lane_for_small_collection(_db, library, languages, priority=0):
+def create_world_languages_lane(
+        _db, library, small_languages, tiny_languages, priority=0,
+):
+    """Create a lane called 'World Languages' whose sublanes represent
+    the non-large language collections available to this library.
+    """
+    if not small_languages and not tiny_languages:
+        # All the languages on this system have large collections, so
+        # there is no need for a 'World Languages' lane.
+        return priority
+
+    complete_language_set = set()
+    for list in (small_languages, tiny_languages):
+        for languageset in list:
+            if isinstance(languageset, basestring):
+                complete_language_set.add(languageset)
+            else:
+                complete_language_set.update(languageset)
+
+
+    world_languages, ignore = create(
+        _db, Lane, library=library,
+        display_name="World Languages",
+        fiction=None,
+        priority=priority,
+        languages=complete_language_set,
+        media=[Edition.BOOK_MEDIUM],
+        genres=[]
+    )
+    priority += 1
+
+    language_priority = 0
+    for small in small_languages:
+        # Create a lane (with sublanes) for each small collection.
+        language_priority = create_lane_for_small_collection(
+            _db, library, world_languages, small, language_priority
+        )
+    for tiny in tiny_languages:
+        # Create a lane (no sublanes) for each tiny collection.
+        language_priority = create_lane_for_tiny_collection(
+            _db, library, world_languages, tiny, language_priority
+        )
+    return priority
+
+def create_lane_for_small_collection(_db, library, parent, languages, priority=0):
+    """Create a lane (with sublanes) for a small collection based on language.
+
+    :param parent: The parent of the new lane.
+    """
     if isinstance(languages, basestring):
         languages = [languages]
 
@@ -619,6 +687,7 @@ def create_lane_for_small_collection(_db, library, languages, priority=0):
 
     common_args = dict(
         languages=languages,
+        media=[Edition.BOOK_MEDIUM],
         genres=[],
     )
     language_identifier = LanguageCodes.name_for_languageset(languages)
@@ -657,6 +726,7 @@ def create_lane_for_small_collection(_db, library, languages, priority=0):
     lane, ignore = create(
         _db, Lane, library=library,
         display_name=language_identifier,
+        parent=parent,
         sublanes=[adult_fiction, adult_nonfiction, ya_children],
         priority=priority,
         **common_args
@@ -664,40 +734,29 @@ def create_lane_for_small_collection(_db, library, languages, priority=0):
     priority += 1
     return priority
 
-def create_lane_for_tiny_collections(_db, library, languages, priority=0):
-    language_lanes = []
+def create_lane_for_tiny_collection(_db, library, parent, languages, priority=0):
+    """Create a single lane for a tiny collection based on language.
 
+    :param parent: The parent of the new lane.
+    """
     if not languages:
         return None
 
     if isinstance(languages, basestring):
         languages = [languages]
 
-    sublane_priority = 0
-    for language_set in languages:
-        name = LanguageCodes.name_for_languageset(language_set)
-        language_lane, ignore = create(
-            _db, Lane, library=library,
-            display_name=name,
-            genres=[],
-            fiction=None,
-            priority=sublane_priority,
-            languages=[language_set],
-        )
-        sublane_priority += 1
-        language_lanes.append(language_lane)
-
-    lane, ignore = create(
-        _db, Lane, library=library, 
-        display_name="Other Languages", 
-        sublanes=language_lanes,
+    name = LanguageCodes.name_for_languageset(languages)
+    language_lane, ignore = create(
+        _db, Lane, library=library,
+        display_name=name,
+        parent=parent,
         genres=[],
+        media=[Edition.BOOK_MEDIUM],
         fiction=None,
-        languages=languages,
         priority=priority,
+        languages=languages,
     )
-    priority += 1
-    return priority
+    return priority + 1
 
 
 class DynamicLane(WorkList):
@@ -859,20 +918,32 @@ class RecommendationLane(WorkBasedLane):
             return metadata.recommendations
         return []
 
-    def apply_filters(self, _db, qu, work_model, facets, pagination, featured=False):
+    def apply_filters(self, _db, qu, facets, pagination, featured=False):
         if not self.recommendations:
             return None
-
-        if work_model != Work:
-            qu = qu.join(LicensePool.identifier)
+        from core.model import MaterializedWorkWithGenre as mw
+        qu = qu.join(LicensePool.identifier)
         qu = Work.from_identifiers(
-            _db, self.recommendations, base_query=qu
+            _db, self.recommendations, base_query=qu,
+            identifier_id_field=mw.identifier_id
         )
         return super(RecommendationLane, self).apply_filters(
-            _db, qu, work_model, facets, pagination, featured=featured)
+            _db, qu, facets, pagination, featured=featured
+        )
+
+
+class FeaturedSeriesFacets(Facets):
+    """A custom Facets object for ordering a lane based on series."""
+
+    def order_by(self):
+        """Order the query results by series position."""
+        from core.model import MaterializedWorkWithGenre as mw
+        fields = (mw.series_position, mw.sort_title)
+        return [x.asc() for x in fields], fields
+
 
 class SeriesLane(DynamicLane):
-    """A lane of Works in a particular series"""
+    """A lane of Works in a particular series."""
 
     ROUTE = 'series'
     MAX_CACHE_AGE = 48*60*60    # 48 hours
@@ -884,7 +955,7 @@ class SeriesLane(DynamicLane):
         self.series = series_name
         display_name = self.series
 
-        if parent and isinstance(parent, WorkBasedLane):
+        if parent and parent.source_audience and isinstance(parent, WorkBasedLane):
             # In an attempt to secure the accurate series, limit the
             # listing to the source's audience sourced from parent data.
             audiences = [parent.source_audience]
@@ -905,28 +976,33 @@ class SeriesLane(DynamicLane):
         )
         return self.ROUTE, kwargs
 
-    def featured_works(self, _db):
-        qu = self.works(_db)
-
-        # Aliasing Edition here allows this query to function
-        # regardless of work_model and existing joins.
-        work_edition = aliased(Edition)
-        qu = qu.join(work_edition).order_by(work_edition.series_position, work_edition.title)
-        target_size = self.get_library(_db).featured_lane_size
-        qu = qu.limit(target_size)
+    def featured_works(self, _db, facets=None):
+        library = self.get_library(_db)
+        new_facets = FeaturedSeriesFacets(
+            library,
+            # If a work is in the right series we don't care about its
+            # quality.
+            collection=FeaturedSeriesFacets.COLLECTION_FULL,
+            availability=FeaturedSeriesFacets.AVAILABLE_ALL,
+            order=None
+        )
+        if facets:
+            new_facets.entrypoint = facets.entrypoint
+        pagination = Pagination(size=library.featured_lane_size)
+        qu = self.works(_db, facets=new_facets, pagination=pagination)
         return qu.all()
 
-    def apply_filters(self, _db, qu, work_model, facets, pagination, featured=False):
+    def apply_filters(self, _db, qu, facets, pagination, featured=False):
         if not self.series:
             return None
-
-        # Aliasing Edition here allows this query to function
-        # regardless of work_model and existing joins.
-        work_edition = aliased(Edition)
-        qu = qu.join(work_edition).filter(work_edition.series==self.series)
+        # We could filter on MaterializedWorkWithGenre.series, but
+        # there's no index on that field, so it would cause a table
+        # scan. Instead we add a join to Edition and filter on the
+        # field there, where it is indexed.
+        qu = qu.join(LicensePool.presentation_edition)
+        qu = qu.filter(Edition.series==self.series)
         return super(SeriesLane, self).apply_filters(
-            _db, qu, work_model, facets, pagination, featured)
-
+            _db, qu, facets, pagination, featured)
 
 class ContributorLane(DynamicLane):
     """A lane of Works written by a particular contributor"""
@@ -967,7 +1043,7 @@ class ContributorLane(DynamicLane):
             Contributor.sort_name==self.contributor_name
         ]
 
-    def apply_filters(self, _db, qu, work_model, facets, pagination, featured=False):
+    def apply_filters(self, _db, qu, facets, pagination, featured=False):
         if not self.contributor_name:
             return None
 
@@ -990,4 +1066,125 @@ class ContributorLane(DynamicLane):
         qu = qu.filter(or_clause)
 
         return super(ContributorLane, self).apply_filters(
-            _db, qu, work_model, facets, pagination, featured=featured)
+            _db, qu, facets, pagination, featured=featured)
+
+class CrawlableFacets(Facets):
+    """A special Facets class for crawlable feeds."""
+    @classmethod
+    def default(cls, library):
+        enabled_facets = {
+            Facets.ORDER_FACET_GROUP_NAME : [Facets.ORDER_LAST_UPDATE],
+            Facets.AVAILABILITY_FACET_GROUP_NAME : [Facets.AVAILABLE_ALL],
+            Facets.COLLECTION_FACET_GROUP_NAME : [Facets.COLLECTION_FULL],
+        }
+        return cls(
+            library,
+            collection=cls.COLLECTION_FULL,
+            availability=cls.AVAILABLE_ALL,
+            order=cls.ORDER_LAST_UPDATE,
+            enabled_facets=enabled_facets,
+            order_ascending=cls.ORDER_DESCENDING,
+        )
+
+    @classmethod
+    def order_by(cls):
+        """Order the search results by last update time."""
+        from core.model import MaterializedWorkWithGenre as work_model
+        # TODO: first_appearance is only necessary here if this is for a custom list.
+        updated = func.greatest(work_model.availability_time, work_model.first_appearance, work_model.last_update_time)
+        collection_id = work_model.collection_id
+        work_id = work_model.works_id
+        return ([updated.desc(), collection_id, work_id],
+                [updated, collection_id, work_id])
+
+
+class CrawlableCollectionBasedLane(DynamicLane):
+
+    LIBRARY_ROUTE = "crawlable_library_feed"
+    COLLECTION_ROUTE = "crawlable_collection_feed"
+
+    def __init__(self, library, collections=None):
+        """Create a lane that finds all books in the given collections.
+
+        :param library: The Library to use for purposes of annotating
+            this Lane's OPDS feed.
+        :param collections: A list of Collections. If none are specified,
+            all Collections associated with `library` will be used.
+        """
+        self.library_id = None
+        if library:
+            self.library_id = library.id
+        self.collection_feed = False
+        if collections:
+            identifier = " / ".join(sorted([x.name for x in collections]))
+            if len(collections) == 1:
+                self.collection_feed = True
+                self.collection_name = collections[0].name
+        else:
+            identifier = library.name
+            collections = library.collections
+        self.initialize(library, "Crawlable feed: %s" % identifier)
+        if collections:
+            # initialize() set the collection IDs to all collections
+            # associated with the library. We may want to restrict that
+            # further.
+            self.collection_ids = [x.id for x in collections]
+
+    def bibliographic_filter_clause(self, _db, qu, featured=False):
+        """Filter out any books that aren't in the right collections."""
+        # The normal behavior of works() is to put a restriction on
+        # collection_ids, so we only need to do something if
+        # there are no collections specified.
+        if not self.collection_ids:
+            # When no collection IDs are specified, there is no lane
+            # whatsoever
+            return None, None
+        return super(
+            CrawlableCollectionBasedLane, self).bibliographic_filter_clause(
+                _db, qu, featured
+            )
+
+    @property
+    def url_arguments(self):
+        if not self.collection_feed:
+            return self.LIBRARY_ROUTE, dict()
+        else:
+            kwargs = dict(
+                collection_name=self.collection_name,
+            )
+            return self.COLLECTION_ROUTE, kwargs
+
+
+class CrawlableCustomListBasedLane(DynamicLane):
+    """A lane that consists of all works in a single CustomList."""
+
+    ROUTE = "crawlable_list_feed"
+
+    uses_customlists = True
+
+    def initialize(self, library, list):
+        super(CrawlableCustomListBasedLane, self).initialize(
+            library, "Crawlable feed: %s" % list.name
+        )
+        self.customlists = [list]
+
+    def bibliographic_filter_clause(self, _db, qu, featured=False):
+        """Filter out any books that aren't in the list, in addition to
+        the normal filters."""
+        qu, clauses = super(CrawlableCustomListBasedLane, self).bibliographic_filter_clause(_db, qu, featured)
+
+        from core.model import MaterializedWorkWithGenre as work_model
+        customlist_clause = work_model.list_id==self.customlists[0].id
+
+        if clauses:
+            clause = and_(clauses, customlist_clause)
+        else:
+            clause = customlist_clause
+        return qu, clause
+
+    @property
+    def url_arguments(self):
+        kwargs = dict(
+            list_name=self.customlists[0].name,
+        )
+        return self.ROUTE, kwargs

@@ -2,6 +2,7 @@ from nose.tools import (
     set_trace,
     eq_,
     assert_raises,
+    assert_raises_regexp,
 )
 import datetime
 import os
@@ -27,6 +28,8 @@ from core.model import (
     Representation,
     RightsStatus,
 )
+from core.util.opds_writer import OPDSFeed
+
 
 class BaseOPDSForDistributorsTest(object):
     base_path = os.path.split(__file__)[0]
@@ -43,6 +46,64 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
         super(TestOPDSForDistributorsAPI, self).setup()
         self.collection = MockOPDSForDistributorsAPI.mock_collection(self._db)
         self.api = MockOPDSForDistributorsAPI(self._db, self.collection)
+
+    def test_external_integration(self):
+        eq_(self.collection.external_integration,
+            self.api.external_integration(self._db))
+
+    def test__run_self_tests(self):
+        """The self-test for OPDSForDistributorsAPI just tries to negotiate
+        a fulfillment token.
+        """
+        class Mock(OPDSForDistributorsAPI):
+            def __init__(self):
+                pass
+
+            def _get_token(self, _db):
+                self.called_with = _db
+                return "a token"
+
+        api = Mock()
+        [result] = api._run_self_tests(self._db)
+        eq_(self._db, api.called_with)
+        eq_("Negotiate a fulfillment token", result.name)
+        eq_(True, result.success)
+        eq_("a token", result.result)
+
+    def test_can_fulfill_without_loan(self):
+        """A book made available through OPDS For Distributors can be
+        fulfilled with no underlying loan, if its delivery mechanism
+        uses bearer token fulfillment.
+        """
+        patron = object()
+        pool = self._licensepool(edition=None, collection=self.collection)
+        [lpdm] = pool.delivery_mechanisms
+
+        m = self.api.can_fulfill_without_loan
+
+        # No LicensePoolDeliveryMechanism -> False
+        eq_(False, m(patron, pool, None))
+
+        # No LicensePool -> False (there can be multiple LicensePools for
+        # a single LicensePoolDeliveryMechanism).
+        eq_(False, m(patron, None, lpdm))
+
+        # No DeliveryMechanism -> False
+        old_dm = lpdm.delivery_mechanism
+        lpdm.delivery_mechanism = None
+        eq_(False, m(patron, pool, lpdm))
+
+        # DRM mechanism requires identifying a specific patron -> False
+        lpdm.delivery_mechanism = old_dm
+        lpdm.delivery_mechanism.drm_scheme = DeliveryMechanism.ADOBE_DRM
+        eq_(False, m(patron, pool, lpdm))
+
+        # Otherwise -> True
+        lpdm.delivery_mechanism.drm_scheme = DeliveryMechanism.NO_DRM
+        eq_(True, m(patron, pool, lpdm))
+
+        lpdm.delivery_mechanism.drm_scheme = DeliveryMechanism.BEARER_TOKEN
+        eq_(True, m(patron, pool, lpdm))
 
     def test_get_token_success(self):
         # The API hasn't been used yet, so it will need to find the auth
@@ -102,7 +163,11 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
     def test_get_token_errors(self):
         no_auth_document = '<feed></feed>'
         self.api.queue_response(200, content=no_auth_document)
-        assert_raises(LibraryAuthorizationFailedException, self.api._get_token, self._db)
+        assert_raises_regexp(
+            LibraryAuthorizationFailedException,
+            "No authentication document link found in http://opds",
+            self.api._get_token, self._db
+        )
 
         feed = '<feed><link rel="http://opds-spec.org/auth/document" href="http://authdoc"/></feed>'
         self.api.queue_response(200, content=feed)
@@ -110,7 +175,11 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
             "authentication": []
         })
         self.api.queue_response(200, content=auth_doc_without_client_credentials)
-        assert_raises(LibraryAuthorizationFailedException, self.api._get_token, self._db)
+        assert_raises_regexp(
+            LibraryAuthorizationFailedException,
+            "Could not find any credential-based authentication mechanisms in http://authdoc",
+            self.api._get_token, self._db
+        )
 
         self.api.queue_response(200, content=feed)
         auth_doc_without_links = json.dumps({
@@ -119,7 +188,11 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
             }]
         })
         self.api.queue_response(200, content=auth_doc_without_links)
-        assert_raises(LibraryAuthorizationFailedException, self.api._get_token, self._db)
+        assert_raises_regexp(
+            LibraryAuthorizationFailedException,
+            "Could not find any authentication links in http://authdoc",
+            self.api._get_token, self._db
+        )
 
         self.api.queue_response(200, content=feed)
         auth_doc = json.dumps({
@@ -134,7 +207,11 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
         self.api.queue_response(200, content=auth_doc)
         token_response = json.dumps({"error": "unexpected error"})
         self.api.queue_response(200, content=token_response)
-        assert_raises(LibraryAuthorizationFailedException, self.api._get_token, self._db)
+        assert_raises_regexp(
+            LibraryAuthorizationFailedException,
+            "Document retrieved from http://authenticate is not a bearer token: {.*unexpected error.*}",
+            self.api._get_token, self._db
+        )
 
     def test_checkin(self):
         # The patron has two loans, one from this API's collection and
@@ -185,6 +262,12 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
         eq_(data_source.name, loan_info.data_source_name)
         eq_(Identifier.URI, loan_info.identifier_type)
         eq_(pool.identifier.identifier, loan_info.identifier)
+
+        # The loan's start date has been set to the current time.
+        now = datetime.datetime.utcnow()
+        assert (now - loan_info.start_date).seconds < 2
+
+        # The loan is of indefinite duration.
         eq_(None, loan_info.end_date)
 
     def test_fulfill(self):
@@ -281,7 +364,7 @@ class TestOPDSForDistributorsAPI(DatabaseTest):
             collection=other_collection,
         )
         p3.loan_to(patron)
-        
+
         activity = self.api.patron_activity(patron, "1234")
         eq_(2, len(activity))
         [l1, l2] = activity
@@ -358,7 +441,9 @@ class TestOPDSForDistributorsReaperMonitor(DatabaseTest, BaseOPDSForDistributors
         class MockOPDSForDistributorsReaperMonitor(OPDSForDistributorsReaperMonitor):
             """An OPDSForDistributorsReaperMonitor that overrides _get."""
             def _get(self, url, headers):
-                return 200, {}, feed
+                return (
+                    200, {'content-type': OPDSFeed.ACQUISITION_FEED_TYPE}, feed
+                )
 
         data_source = DataSource.lookup(self._db, "Biblioboard", autocreate=True)
         collection = MockOPDSForDistributorsAPI.mock_collection(self._db)

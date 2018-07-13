@@ -263,16 +263,17 @@ class SIPClient(Constants):
             self.logged_in = True
             self.must_log_in = False
 
+        # socket_lock controls access to the socket connection to the
+        # SIP2 server.
+        #
+        # We need to use an RLock here because both connect() and
+        # make_request() require the lock, and make_request() will end
+        # up calling connect() if there's an error.
+        self.socket_lock = threading.RLock()
+
         # The only reason connect would be false is that we're running
         # a unit test and don't actually want to use a server.
         if connect:
-            # socket_lock controls access to the socket connection to the
-            # SIP2 server.
-            #
-            # We need to use an RLock here because both connect() and
-            # make_request() require the lock, and make_request() will end
-            # up calling connect() if there's an error.
-            self.socket_lock = threading.RLock()
             self.connect()
         
     def login(self, *args, **kwargs):
@@ -303,6 +304,7 @@ class SIPClient(Constants):
                         self.target_server, self.target_port
                     )
                 )
+            sock.settimeout(12)
 
             # Since this is a new socket connection, reset the message count
             # and, potentially, logged_in.
@@ -707,9 +709,9 @@ class SIPClient(Constants):
         while not done:
             tmp = self.socket.recv(4096)
             data = data + tmp
-            if not data:
+            if not tmp:
                 raise IOError("No data read from socket.")
-            if ord(data[-1]) == 13:
+            if ord(data[-1]) == 13 or ord(data[-1]) == 10:
                 done = True
             if len(data) > max_size:
                 raise IOError("SIP2 response too large.")

@@ -28,6 +28,7 @@ from core.metadata_layer import (
     SubjectData,
 )
 
+from api.authenticator import BasicAuthenticationProvider
 from api.axis import (
     AxisCollectionReaper,
     Axis360CirculationMonitor,
@@ -74,6 +75,102 @@ class Axis360Test(DatabaseTest):
 
         
 class TestAxis360API(Axis360Test):
+
+    def test_external_integration(self):
+        eq_(
+            self.collection.external_integration,
+            self.api.external_integration(object())
+        )
+
+    def test__run_self_tests(self):
+        """Verify that BibliothecaAPI._run_self_tests() calls the right
+        methods.
+        """
+        class Mock(MockAxis360API):
+            "Mock every method used by Axis360API._run_self_tests."
+
+            # First we will refresh the bearer token.
+            def refresh_bearer_token(self):
+                return "the new token"
+
+            # Then we will count the number of events in the past
+            # give minutes.
+            def recent_activity(self, since):
+                self.recent_activity_called_with = since
+                return [(1,"a"),(2, "b"), (3, "c")]
+
+            # Then we will count the loans and holds for the default
+            # patron.
+            def patron_activity(self, patron, pin):
+                self.patron_activity_called_with = (patron, pin)
+                return ["loan", "hold"]
+
+        # Now let's make sure two Libraries have access to this
+        # Collection -- one library with a default patron and one
+        # without.
+        no_default_patron = self._library()
+        self.collection.libraries.append(no_default_patron)
+
+        with_default_patron = self._default_library
+        integration = self._external_integration(
+            "api.simple_authentication",
+            ExternalIntegration.PATRON_AUTH_GOAL,
+            libraries=[with_default_patron]
+        )
+        p = BasicAuthenticationProvider
+        integration.setting(p.TEST_IDENTIFIER).value = "username1"
+        integration.setting(p.TEST_PASSWORD).value = "password1"
+
+        # Now that everything is set up, run the self-test.
+        api = Mock(self._db, self.collection)
+        now = datetime.datetime.utcnow()
+        [no_patron_credential, recent_circulation_events, patron_activity,
+         refresh_bearer_token] = sorted(
+            api._run_self_tests(self._db), key=lambda x: x.name
+        )
+        eq_("Refreshing bearer token", refresh_bearer_token.name)
+        eq_(True, refresh_bearer_token.success)
+        eq_("the new token", refresh_bearer_token.result)
+
+        eq_(
+            "Acquiring test patron credentials for library %s" % no_default_patron.name,
+            no_patron_credential.name
+        )
+        eq_(False, no_patron_credential.success)
+        eq_("Library has no test patron configured.",
+            no_patron_credential.exception.message)
+
+        eq_("Asking for circulation events for the last five minutes",
+            recent_circulation_events.name)
+        eq_(True, recent_circulation_events.success)
+        eq_("Found 3 event(s)", recent_circulation_events.result)
+        since = api.recent_activity_called_with
+        five_minutes_ago = datetime.datetime.utcnow() - datetime.timedelta(minutes=5)
+        assert (five_minutes_ago-since).total_seconds() < 2
+
+        eq_("Checking activity for test patron for library %s" % with_default_patron.name,
+            patron_activity.name)
+        eq_(True, patron_activity.success)
+        eq_("Found 2 loans/holds", patron_activity.result)
+        patron, pin = api.patron_activity_called_with
+        eq_("username1", patron.authorization_identifier)
+        eq_("password1", pin)
+
+    def test__run_self_tests_short_circuit(self):
+        """If we can't refresh the bearer token, the rest of the
+        self-tests aren't even run.
+        """
+        class Mock(MockAxis360API):
+            def refresh_bearer_token(self):
+                raise Exception("no way")
+
+        # Now that everything is set up, run the self-test. Only one
+        # test will be run.
+        api = Mock(self._db, self.collection)
+        [failure] = api._run_self_tests(self._db)
+        eq_("Refreshing bearer token", failure.name)
+        eq_(False, failure.success)
+        eq_("no way", failure.exception.message)
 
     def test_update_availability(self):
         """Test the Axis 360 implementation of the update_availability method
@@ -134,6 +231,138 @@ class TestAxis360API(Axis360Test):
         [request] = self.api.requests
         params = request[-1]['params']
         eq_('notifications@example.com', params['email'])
+
+    def test_update_licensepools_for_identifiers(self):
+
+        class Mock(MockAxis360API):
+            """Simulates an Axis 360 API that knows about some
+            books but not others.
+            """
+            updated = []
+            reaped = []
+
+            def _fetch_remote_availability(self, identifiers):
+                for i, identifier in enumerate(identifiers):
+                    # The first identifer in the list is still
+                    # available.
+                    identifier_data = IdentifierData(
+                        type=identifier.type,
+                        identifier=identifier.identifier
+                    )
+                    metadata = Metadata(
+                        data_source=DataSource.AXIS_360,
+                        primary_identifier=identifier_data
+                    )
+                    availability = CirculationData(
+                        data_source=DataSource.AXIS_360,
+                        primary_identifier=identifier_data,
+                        licenses_owned=7,
+                        licenses_available=6
+                    )
+                    yield metadata, availability
+
+                    # The rest have been 'forgotten' by Axis 360.
+                    break
+
+            def _reap(self, identifier):
+                self.reaped.append(identifier)
+
+        api = Mock(self._db, self.collection)
+        still_in_collection = self._identifier(
+            identifier_type=Identifier.AXIS_360_ID
+        )
+        no_longer_in_collection = self._identifier(
+            identifier_type=Identifier.AXIS_360_ID
+        )
+        api.update_licensepools_for_identifiers(
+            [still_in_collection, no_longer_in_collection]
+        )
+
+        # The LicensePool for the first identifier was updated.
+        [lp] = still_in_collection.licensed_through
+        eq_(7, lp.licenses_owned)
+        eq_(6, lp.licenses_available)
+
+        # The second was reaped.
+        eq_([no_longer_in_collection], api.reaped)
+
+    def test_fetch_remote_availability(self):
+        """Test the _fetch_remote_availability method, as
+        used by update_licensepools_for_identifiers.
+        """
+        id1 = self._identifier(identifier_type=Identifier.AXIS_360_ID)
+        id2 = self._identifier(identifier_type=Identifier.AXIS_360_ID)
+        data = self.sample_data("availability_with_loans.xml")
+        # Modify the sample data so that it appears to be talking
+        # about one of the books we're going to request.
+        data = data.replace("0012533119", id1.identifier.encode("ascii"))
+        self.api.queue_response(200, {}, data)
+        results = [x for x in self.api._fetch_remote_availability([id1, id2])]
+
+        # We asked for information on two identifiers.
+        [request] = self.api.requests
+        kwargs = request[-1]
+        eq_({'titleIds': u'2001,2002'}, kwargs['params'])
+
+        # We got information on only one.
+        [(metadata, circulation)] = results
+        eq_((id1, False), metadata.primary_identifier.load(self._db))
+        eq_(u'El caso de la gracia : Un periodista explora las evidencias de unas vidas transformadas', metadata.title)
+        eq_(2, circulation.licenses_owned)
+
+    def test_reap(self):
+        """Test the _reap method, as used by
+        update_licensepools_for_identifiers.
+        """
+        id1 = self._identifier(identifier_type=Identifier.AXIS_360_ID)
+        eq_([], id1.licensed_through)
+
+        # If there is no LicensePool to reap, nothing happens.
+        self.api._reap(id1)
+        eq_([], id1.licensed_through)
+
+        # If there is a LicensePool but it has no owned licenses,
+        # it's already been reaped, so nothing happens.
+        edition, pool, = self._edition(
+            data_source_name=DataSource.AXIS_360,
+            identifier_type=id1.type, identifier_id=id1.identifier,
+            with_license_pool=True, collection=self.collection
+        )
+
+        # This LicensePool has licenses, but it's not in a different
+        # collection from the collection associated with this
+        # Axis360API object, so it's not affected.
+        collection2 = self._collection()
+        edition2, pool2, = self._edition(
+            data_source_name=DataSource.AXIS_360,
+            identifier_type=id1.type, identifier_id=id1.identifier,
+            with_license_pool=True, collection=collection2
+        )
+
+        pool.licenses_owned = 0
+        pool2.licenses_owned = 10
+        self._db.commit()
+        updated = pool.last_checked
+        updated2 = pool2.last_checked
+        self.api._reap(id1)
+
+        eq_(updated, pool.last_checked)
+        eq_(0, pool.licenses_owned)
+        eq_(updated2, pool2.last_checked)
+        eq_(10, pool2.licenses_owned)
+
+        # If the LicensePool did have licenses, then reaping it
+        # reflects the fact that the licenses are no longer owned.
+        pool.licenses_owned = 10
+        pool.licenses_available = 9
+        pool.licenses_reserved = 8
+        pool.patrons_in_hold_queue = 7
+        self.api._reap(id1)
+        eq_(0, pool.licenses_owned)
+        eq_(0, pool.licenses_available)
+        eq_(0, pool.licenses_reserved)
+        eq_(0, pool.patrons_in_hold_queue)
+
 
 class TestCirculationMonitor(Axis360Test):
 
@@ -276,7 +505,7 @@ class TestReaper(Axis360Test):
             self._db, self.collection,
             api_class=MockAxis360API
         )
-        
+
 
 class TestResponseParser(object):
 

@@ -1,11 +1,19 @@
 import json
 from nose.tools import set_trace
+from collections import defaultdict
 
 from admin_authentication_provider import AdminAuthenticationProvider
-from problem_details import GOOGLE_OAUTH_FAILURE
+from problem_details import GOOGLE_OAUTH_FAILURE, INVALID_ADMIN_CREDENTIALS
 from oauth2client import client as GoogleClient
 from flask_babel import lazy_gettext as _
-from core.model import ExternalIntegration
+from core.model import (
+    Admin,
+    AdminRole,
+    ConfigurationSetting,
+    ExternalIntegration,
+    Session,
+    get_one,
+)
 
 class GoogleOAuthAdminAuthenticationProvider(AdminAuthenticationProvider):
 
@@ -14,6 +22,7 @@ class GoogleOAuthAdminAuthenticationProvider(AdminAuthenticationProvider):
                     "<p>To use this integration, visit <a target='_blank' href='https://console.developers.google.com/apis/dashboard'>the Google developer console.</a> " +
                     "Create a project, click 'Create Credentials' in the left sidebar, and select 'OAuth client ID'. " +
                     "If you get a warning about the consent screen, click 'Configure consent screen' and enter your library name as the product name. Save the consent screen information.</p>" +
+                    "<p>Choose 'Web Application' as the application type.</p>" +
                     "<p>Leave 'Authorized JavaScript origins' blank, but under 'Authorized redirect URIs', add the url of your circulation manager followed by '/admin/GoogleAuth/callback', e.g. 'http://mycircmanager.org/admin/GoogleAuth/callback'.</p>" +
                     "<p>Click create, and you'll get a popup with your new client ID and secret. Copy these values and enter them in the form below.</p>"),
     DOMAINS = "domains"
@@ -22,12 +31,20 @@ class GoogleOAuthAdminAuthenticationProvider(AdminAuthenticationProvider):
         { "key": ExternalIntegration.URL, "label": _("Authentication URI"), "default": "https://accounts.google.com/o/oauth2/auth" },
         { "key": ExternalIntegration.USERNAME, "label": _("Client ID") },
         { "key": ExternalIntegration.PASSWORD, "label": _("Client Secret") },
+    ]
+
+    LIBRARY_SETTINGS = [
         { "key": DOMAINS,
           "label": _("Allowed Domains"),
-          "description": _("Admins must have an email address from one of these domains to sign in."),
+          "optional": True,
+          "description": _("Anyone who logs in with an email address from one of these domains will automatically have librarian-level access to this library. Library manager roles must still be granted individually by other admins. If you want to set up admins individually but still allow them to log in with Google, you can create the admin authentication service without adding any libraries."),
           "type": "list" },
     ]
     SITEWIDE = True
+
+    TEMPLATE = """
+<a href=%(auth_uri)s>Sign In With Google</a>
+"""
 
     def __init__(self, integration, redirect_uri, test_mode=False):
         super(GoogleOAuthAdminAuthenticationProvider, self).__init__(integration)
@@ -51,14 +68,24 @@ class GoogleOAuthAdminAuthenticationProvider(AdminAuthenticationProvider):
 
     @property
     def domains(self):
-        if self.integration and self.integration.setting(self.DOMAINS).value:
-            return json.loads(self.integration.setting(self.DOMAINS).value)
-        return []
+        domains = defaultdict(list)
+        if self.integration:
+            _db = Session.object_session(self.integration)
+            for library in self.integration.libraries:
+                setting = ConfigurationSetting.for_library_and_externalintegration(
+                    _db, self.DOMAINS, library, self.integration)
+                if setting.json_value:
+                    for domain in setting.json_value:
+                        domains[domain.lower()].append(library)
+        return domains
+
+    def sign_in_template(self, redirect_url):
+        return self.TEMPLATE % dict(auth_uri = self.auth_uri(redirect_url))
 
     def auth_uri(self, redirect_url):
         return self.client.step1_get_authorize_url(state=redirect_url)
 
-    def callback(self, request={}):
+    def callback(self, _db, request={}):
         """Google OAuth sign-in flow"""
 
         # The Google OAuth client sometimes hits the callback with an error.
@@ -73,9 +100,18 @@ class GoogleOAuthAdminAuthenticationProvider(AdminAuthenticationProvider):
                 credentials = self.client.step2_exchange(auth_code)
             except GoogleClient.FlowExchangeError, e:
                 return self.google_error_problem_detail(e.message), None
+            email = credentials.id_token.get('email')
+            if not self.staff_email(_db, email):
+                return INVALID_ADMIN_CREDENTIALS, None
+            domain = email[email.index('@')+1:].lower()
+            roles = []
+            for library in self.domains[domain]:
+                roles.append({ "role": AdminRole.LIBRARIAN, "library": library.short_name })
             return dict(
-                email=credentials.id_token.get('email'),
+                email=email,
                 credentials=credentials.to_json(),
+                type=self.NAME,
+                roles=roles,
             ), redirect_url
 
     def google_error_problem_detail(self, error):
@@ -98,6 +134,17 @@ class GoogleOAuthAdminAuthenticationProvider(AdminAuthenticationProvider):
             return not oauth_credentials.access_token_expired
         return False
 
+    def staff_email(self, _db, email):
+        # If the admin already exists in the database, they can log in regardless of
+        # whether their domain has been whitelisted for a library.
+        admin = get_one(_db, Admin, email=email)
+        if admin:
+            return True
+
+        # Otherwise, their email must match one of the configured domains.
+        staff_domains = self.domains.keys()
+        domain = email[email.index('@')+1:]
+        return domain.lower() in [staff_domain.lower() for staff_domain in staff_domains]
 
 class DummyGoogleClient(object):
     """Mock Google OAuth client for testing"""

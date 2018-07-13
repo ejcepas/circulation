@@ -5,8 +5,10 @@ from nose.tools import (
     assert_raises,
 )
 import datetime
+import json
 import os
 import pkgutil
+import random
 
 from . import (
     DatabaseTest,
@@ -34,7 +36,9 @@ from core.model import (
 from core.util.http import (
     BadResponseException,
 )
+from core.util.web_publication_manifest import AudiobookManifest
 
+from api.authenticator import BasicAuthenticationProvider
 from api.circulation import (
     CirculationAPI,
     FulfillmentInfo,
@@ -68,6 +72,77 @@ class BibliothecaAPITest(DatabaseTest):
         return sample_data(filename, 'bibliotheca')
 
 class TestBibliothecaAPI(BibliothecaAPITest):      
+
+    def test_external_integration(self):
+        eq_(
+            self.collection.external_integration,
+            self.api.external_integration(object())
+        )
+
+    def test__run_self_tests(self):
+        """Verify that BibliothecaAPI._run_self_tests() calls the right
+        methods.
+        """
+        class Mock(MockBibliothecaAPI):
+            "Mock every method used by BibliothecaAPI._run_self_tests."
+
+            # First we will count the circulation events that happened in the
+            # last five minutes.
+            def get_events_between(self, start, finish):
+                self.get_events_between_called_with = (start, finish)
+                return [1,2,3]
+
+            # Then we will count the loans and holds for the default
+            # patron.
+            def patron_activity(self, patron, pin):
+                self.patron_activity_called_with = (patron, pin)
+                return ["loan", "hold"]
+
+        # Now let's make sure two Libraries have access to this
+        # Collection -- one library with a default patron and one
+        # without.
+        no_default_patron = self._library()
+        self.collection.libraries.append(no_default_patron)
+
+        with_default_patron = self._default_library
+        integration = self._external_integration(
+            "api.simple_authentication",
+            ExternalIntegration.PATRON_AUTH_GOAL,
+            libraries=[with_default_patron]
+        )
+        p = BasicAuthenticationProvider
+        integration.setting(p.TEST_IDENTIFIER).value = "username1"
+        integration.setting(p.TEST_PASSWORD).value = "password1"
+
+        # Now that everything is set up, run the self-test.
+        api = Mock(self._db, self.collection)
+        now = datetime.datetime.utcnow()
+        [no_patron_credential, recent_circulation_events, patron_activity] = sorted(
+            api._run_self_tests(self._db), key=lambda x: x.name
+        )
+
+        eq_(
+            "Acquiring test patron credentials for library %s" % no_default_patron.name,
+            no_patron_credential.name
+        )
+        eq_(False, no_patron_credential.success)
+        eq_("Library has no test patron configured.",
+            no_patron_credential.exception.message)
+
+        eq_("Asking for circulation events for the last five minutes",
+            recent_circulation_events.name)
+        eq_(True, recent_circulation_events.success)
+        eq_("Found 3 event(s)", recent_circulation_events.result)
+        start, end = api.get_events_between_called_with
+        eq_(5*60, (end-start).total_seconds())
+        assert (end-now).total_seconds() < 2
+
+        eq_("Checking activity for test patron for library %s" % with_default_patron.name,
+            patron_activity.name)
+        eq_("Found 2 loans/holds", patron_activity.result)
+        patron, pin = api.patron_activity_called_with
+        eq_("username1", patron.authorization_identifier)
+        eq_("password1", pin)
 
     def test_get_events_between_success(self):
         data = self.sample_data("empty_end_date_event.xml")
@@ -197,10 +272,10 @@ class TestBibliothecaAPI(BibliothecaAPITest):
         eq_(datetime.datetime(2015, 3, 13, 13, 38, 19), l2.start)
         eq_(datetime.datetime(2015, 4, 3, 13, 38, 19), l2.end)
 
-        # This hold has no end date because there's no decision to be
-        # made. The patron is fourth in line.
+        # The patron is fourth in line. The end date is an estimate
+        # of when the hold will be available to check out.
         eq_(datetime.datetime(2015, 3, 24, 15, 6, 56), h1.start)
-        eq_(None, h1.end)
+        eq_(datetime.datetime(2015, 3, 24, 15, 7, 51), h1.end)
         eq_(4, h1.position)
 
         # The hold has an end date. It's time for the patron to decide
@@ -244,9 +319,10 @@ class TestBibliothecaAPI(BibliothecaAPITest):
 
         # This miracle book is available either as an audiobook or as
         # an EPUB.
-        edition, pool = self._edition(
+        work = self._work(
             data_source_name=DataSource.BIBLIOTHECA, with_license_pool=True
         )
+        [pool] = work.license_pools
 
         # Let's fulfill the EPUB first.
         self.api.queue_response(
@@ -264,18 +340,120 @@ class TestBibliothecaAPI(BibliothecaAPITest):
         eq_("presumably/an-acsm", fulfillment.content_type)
 
         # Now let's try the audio version.
+        license = self.sample_data("sample_findaway_audiobook_license.json")
         self.api.queue_response(
             200, headers={"Content-Type": "application/json"},
-            content="this is a Findaway license"
+            content=license
         )
         fulfillment = self.api.fulfill(patron, 'password', pool, 'MP3')
         assert isinstance(fulfillment, FulfillmentInfo)
-        eq_("this is a Findaway license", fulfillment.content)
 
-        # The only difference here is that the media type reported by
-        # the server is _not_ passed through; it's replaced by a more
-        # specific media type
+        # Here, the media type reported by the server is not passed
+        # through; it's replaced by a more specific media type
         eq_(DeliveryMechanism.FINDAWAY_DRM, fulfillment.content_type)
+
+        # The document sent by the 'Findaway' server has been
+        # converted into a web publication manifest.
+        manifest = json.loads(fulfillment.content)
+
+        # The conversion process is tested more fully in
+        # test_findaway_license_to_webpub_manifest. This just verifies
+        # that the manifest contains information from the 'Findaway'
+        # document as well as information from the Work.
+        metadata = manifest['metadata']
+        eq_('abcdef01234789abcdef0123', metadata['encrypted']['findaway:checkoutId'])
+        eq_(work.title, metadata['title'])
+
+        # Now let's see what happens to fulfillment when 'Findaway' or
+        # 'Bibliotheca' sends bad information.
+        bad_media_type = "application/error+json"
+        bad_content = "This is not my beautiful license document!"
+        self.api.queue_response(
+            200, headers={"Content-Type": bad_media_type},
+            content=bad_content
+        )
+        fulfillment = self.api.fulfill(patron, 'password', pool, 'MP3')
+        assert isinstance(fulfillment, FulfillmentInfo)
+
+        # The (apparently) bad document is just passed on to the
+        # client as part of the FulfillmentInfo, in the hopes that the
+        # client will know what to do with it.
+        eq_(bad_media_type, fulfillment.content_type)
+        eq_(bad_content, fulfillment.content)
+
+    def test_findaway_license_to_webpub_manifest(self):
+        work = self._work(with_license_pool=True)
+        [pool] = work.license_pools
+        document = self.sample_data("sample_findaway_audiobook_license.json")
+
+        # Randomly scramble the Findaway manifest to make sure it gets
+        # properly sorted when converted to a Webpub-like manifest.
+        document = json.loads(document)
+        document['items'].sort(key=lambda x: random.random())
+        document = json.dumps(document)
+
+        m = BibliothecaAPI.findaway_license_to_webpub_manifest
+        media_type, manifest = m(pool, document)
+        eq_(DeliveryMechanism.FINDAWAY_DRM, media_type)
+        manifest = json.loads(manifest)
+
+        # We use the default context for Web Publication Manifest
+        # files, but we also define an extension context called
+        # 'findaway', which lets us include terms coined by Findaway
+        # in a normal Web Publication Manifest document.
+        context = manifest['@context']
+        default, findaway = context
+        eq_(AudiobookManifest.DEFAULT_CONTEXT, default)
+        eq_({"findaway" : BibliothecaAPI.FINDAWAY_EXTENSION_CONTEXT},
+           findaway)
+
+        metadata = manifest['metadata']
+
+        # Information about the book has been added to metadata.
+        # (This is tested more fully in
+        # core/tests/util/test_util_web_publication_manifest.py.)
+        eq_(work.title, metadata['title'])
+        eq_(pool.identifier.urn, metadata['identifier'])
+        eq_('en', metadata['language'])
+
+        # Information about the license has been added to an 'encrypted'
+        # object within metadata.
+        encrypted = metadata['encrypted']
+        eq_(u'http://librarysimplified.org/terms/drm/scheme/FAE',
+            encrypted['scheme'])
+        eq_(u'abcdef01234789abcdef0123', encrypted[u'findaway:checkoutId'])
+        eq_(u'1234567890987654321ababa', encrypted[u'findaway:licenseId'])
+        eq_(u'3M', encrypted[u'findaway:accountId'])
+        eq_(u'123456', encrypted[u'findaway:fulfillmentId'])
+        eq_(u'aaaaaaaa-4444-cccc-dddd-666666666666', 
+            encrypted[u'findaway:sessionKey'])
+
+        # Every entry in the license document's 'items' list has
+        # become a spine item in the manifest.
+        spine = manifest['spine']
+        eq_(79, len(spine))
+
+        # The duration of each spine item has been converted to
+        # seconds.
+        first = spine[0]
+        eq_(16.201, first['duration'])
+        eq_("Track 1", first['title'])
+
+        # There is no 'href' value for the spine items because the
+        # files must be obtained through the Findaway SDK rather than
+        # through regular HTTP requests.
+        #
+        # Since this is a relatively small book, it only has one part,
+        # part #0. Within that part, the items have been sorted by
+        # their sequence.
+        for i, item in enumerate(spine):
+            eq_(None, item['href'])
+            eq_(Representation.MP3_MEDIA_TYPE, item['type'])
+            eq_(0, item['findaway:part'])
+            eq_(i+1, item['findaway:sequence'])
+
+        # The total duration, in seconds, has been added to metadata.
+        eq_(28371, int(metadata['duration']))
 
 
 class TestBibliothecaCirculationSweep(BibliothecaAPITest):

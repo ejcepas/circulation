@@ -1,6 +1,8 @@
 # encoding: utf-8
+from collections import Counter
 from nose.tools import set_trace, eq_, assert_raises
 import json
+import datetime
 
 from . import (
     DatabaseTest,
@@ -12,14 +14,17 @@ from core.lane import (
     WorkList,
 )
 from core.metadata_layer import Metadata
+from core.lane import FacetsWithEntryPoint
 from core.model import (
     create,
     Contribution,
     Contributor,
+    Edition,
     SessionManager,
     DataSource,
     ExternalIntegration,
     Library,
+    MaterializedWorkWithGenre,
 )
 
 from api.config import (
@@ -30,9 +35,15 @@ from api.lanes import (
     create_default_lanes,
     create_lanes_for_large_collection,
     create_lane_for_small_collection,
-    create_lane_for_tiny_collections,
+    create_lane_for_tiny_collection,
+    create_world_languages_lane,
+    _lane_configuration_from_collection_sizes,
     load_lanes,
     ContributorLane,
+    CrawlableCollectionBasedLane,
+    CrawlableFacets,
+    CrawlableCustomListBasedLane,
+    FeaturedSeriesFacets,
     RecommendationLane,
     RelatedBooksLane,
     SeriesLane,
@@ -60,12 +71,16 @@ class TestLaneCreation(DatabaseTest):
             # They all are restricted to English and Spanish.
             eq_(x.languages, languages)
 
+            # They have no restrictions on media type -- that's handled
+            # with entry points.
+            eq_(None, x.media)
+
         eq_(
             ['Fiction', 'Nonfiction', 'Young Adult Fiction',
              'Young Adult Nonfiction', 'Children and Middle Grade'],
             [x.display_name for x in lanes]
         )
-
+        
 
         # The Adult Fiction and Adult Nonfiction lanes reproduce the
         # genre structure found in the genre definitions.
@@ -124,11 +139,55 @@ class TestLaneCreation(DatabaseTest):
         nyt_data_source = DataSource.lookup(self._db, DataSource.NYT)
         eq_(nyt_data_source, lanes[0].list_datasource)
 
+    def test_create_world_languages_lane(self):
+        # If there are no small or tiny collections, calling
+        # create_world_languages_lane does not create any lanes or change
+        # the priority.
+        new_priority = create_world_languages_lane(
+            self._db, self._default_library, [], [], priority=10
+        )
+        eq_(10, new_priority)
+        eq_([], self._db.query(Lane).all())
+
+        # If there are lanes to be created, create_world_languages_lane
+        # creates them.
+        new_priority = create_world_languages_lane(
+            self._db, self._default_library,
+            ["eng"], [["spa", "fre"]], priority=10
+        )
+
+        # priority has been incremented to make room for the newly
+        # created lane.
+        eq_(11, new_priority)
+
+        # One new top-level lane has been created. It contains books
+        # from all three languages mentioned in its children.
+        top_level = self._db.query(Lane).filter(Lane.parent==None).one()
+        eq_("World Languages", top_level.display_name)
+        eq_(set(['spa', 'fre', 'eng']), top_level.languages)
+
+        # It has two children -- one for the small English collection and
+        # one for the tiny Spanish/French collection.,
+        small, tiny = top_level.visible_children
+        eq_(u'English', small.display_name)
+        eq_([u'eng'], small.languages)
+
+        eq_(u'espa\xf1ol/fran\xe7ais', tiny.display_name)
+        eq_([u'spa', u'fre'], tiny.languages)
+
+        # The tiny collection has no sublanes, but the small one has
+        # three.  These lanes are tested in more detail in
+        # test_create_lane_for_small_collection.
+        fiction, nonfiction, children = small.sublanes
+        eq_([], tiny.sublanes)
+        eq_("Fiction", fiction.display_name)
+        eq_("Nonfiction", nonfiction.display_name)
+        eq_("Children & Young Adult", children.display_name)
 
     def test_create_lane_for_small_collection(self):
         languages = ['eng', 'spa', 'chi']
         create_lane_for_small_collection(
-            self._db, self._default_library, languages
+            self._db, self._default_library, None, languages
         )
         [lane] = self._db.query(Lane).filter(Lane.parent_id==None).all()
 
@@ -140,6 +199,8 @@ class TestLaneCreation(DatabaseTest):
         )
         for x in sublanes:
             eq_(languages, x.languages)
+            eq_([Edition.BOOK_MEDIUM], x.media)
+
         eq_(
             [set(['Adults Only', 'Adult']), 
              set(['Adults Only', 'Adult']), 
@@ -150,25 +211,19 @@ class TestLaneCreation(DatabaseTest):
             [x.fiction for x in sublanes]
         )
 
-    def test_lane_for_other_languages(self):
-        # If no tiny languages are configured, the other languages lane
-        # doesn't show up.
-        create_lane_for_tiny_collections(self._db, self._default_library, [])
-        eq_(0, self._db.query(Lane).filter(Lane.parent_id==None).count())
-
-
-        create_lane_for_tiny_collections(self._db, self._default_library, ['ger', 'fre', 'ita'])
-        [lane] = self._db.query(Lane).filter(Lane.parent_id==None).all()
-        eq_(['ger', 'fre', 'ita'], lane.languages)
-        eq_("Other Languages", lane.display_name)
-        eq_(
-            ['Deutsch', u'français', 'Italiano'],
-            [x.display_name for x in lane.visible_children]
+    def test_lane_for_tiny_collection(self):
+        parent = self._lane()
+        new_priority = create_lane_for_tiny_collection(
+            self._db, self._default_library, parent, 'ger',
+            priority=3
         )
-        eq_([['ger'], ['fre'], ['ita']],
-            [x.languages for x in lane.visible_children]
-        )
-
+        eq_(4, new_priority)
+        lane = self._db.query(Lane).filter(Lane.parent==parent).one()
+        eq_([Edition.BOOK_MEDIUM], lane.media)
+        eq_(parent, lane.parent)
+        eq_(['ger'], lane.languages)
+        eq_(u'Deutsch', lane.display_name)
+        eq_([], lane.children)
 
     def test_create_default_lanes(self):
         library = self._default_library
@@ -197,47 +252,36 @@ class TestLaneCreation(DatabaseTest):
         # a top-level lane for each small collection, and a lane
         # for everything left over.
         eq_(set(['Fiction', "Nonfiction", "Young Adult Fiction", "Young Adult Nonfiction",
-                 "Children and Middle Grade", u'español', 'Chinese', 'Other Languages']),
+                 "Children and Middle Grade", u'World Languages']),
             set([x.display_name for x in lanes])
         )
 
         [english_fiction_lane] = [x for x in lanes if x.display_name == 'Fiction']
         eq_(0, english_fiction_lane.priority)
-        [chinese_lane] = [x for x in lanes if x.display_name == 'Chinese']
-        eq_(6, chinese_lane.priority)
-        [other_lane] = [x for x in lanes if x.display_name == 'Other Languages']
-        eq_(7, other_lane.priority)
+        [world] = [x for x in lanes if x.display_name == 'World Languages']
+        eq_(5, world.priority)
 
-    def test_load_lanes(self):
-        # These two top-level lanes should be children of the WorkList.
-        lane1 = self._lane(display_name="Top-level Lane 1")
-        lane1.priority = 0
-        lane2 = self._lane(display_name="Top-level Lane 2")
-        lane2.priority = 1
+    def test_lane_configuration_from_collection_sizes(self):
 
-        # This lane is invisible and will be filtered out.
-        invisible_lane = self._lane(display_name="Invisible Lane")
-        invisible_lane.visible = False
+        # If the library has no holdings, we assume it has a large English
+        # collection.
+        m = _lane_configuration_from_collection_sizes
+        eq_(([u'eng'], [], []), m(None))
+        eq_(([u'eng'], [], []), m(Counter()))
 
-        # This lane has a parent and will be filtered out.
-        sublane = self._lane(display_name="Sublane")
-        lane1.sublanes.append(sublane)
-
-        # This lane belongs to a different library.
-        other_library = self._library(
-            name="Other Library", short_name="Other"
-        )
-        other_library_lane = self._lane(
-            display_name="Other Library Lane", library=other_library
-        )
-
-        # The default library gets a WorkList with the two top-level lanes as children.
-        wl = load_lanes(self._db, self._default_library)
-        eq_([lane1, lane2], wl.children)
-
-        # The other library only has one top-level lane, so we use that lane.
-        l = load_lanes(self._db, other_library)
-        eq_(other_library_lane, l)
+        # Otherwise, the language with the largest collection, and all
+        # languages more than 10% as large, go into `large`.  All
+        # languages with collections more than 1% as large as the
+        # largest collection go into `small`. All languages with
+        # smaller collections go into `tiny`.
+        base = 10000
+        holdings = Counter(large1=base, large2=base*0.1001,
+                           small1=base*0.1, small2=base*0.01001,
+                           tiny=base*0.01)
+        large, small, tiny = m(holdings)
+        eq_(set(['large1', 'large2']), set(large))
+        eq_(set(['small1', 'small2']), set(small))
+        eq_(['tiny'], tiny)
 
 class TestWorkBasedLane(DatabaseTest):
 
@@ -515,6 +559,9 @@ class TestSeriesLane(LaneTest):
         assert_raises(
             ValueError, SeriesLane, self._default_library, ''
         )
+        assert_raises(
+            ValueError, SeriesLane, self._default_library, None
+        )
 
         lane = SeriesLane(self._default_library, 'Alrighty Then')
         eq_('Alrighty Then', lane.series)
@@ -528,6 +575,7 @@ class TestSeriesLane(LaneTest):
         # Works in the series are returned as expected.
         w1 = self._work(with_license_pool=True)
         w1.presentation_edition.series = series_name
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
         self.assert_works_queries(lane, [w1])
 
@@ -537,12 +585,14 @@ class TestSeriesLane(LaneTest):
         w2 = self._work(with_license_pool=True)
         w2.presentation_edition.title = "Anthropology"
         w2.presentation_edition.series = series_name
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
         self.assert_works_queries(lane, [w2, w1])
 
         # If a series_position is added, they're ordered in numerical order.
         w1.presentation_edition.series_position = 6
         w2.presentation_edition.series_position = 13
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
         self.assert_works_queries(lane, [w1, w2])
 
@@ -552,6 +602,7 @@ class TestSeriesLane(LaneTest):
         spa = self._work(with_license_pool=True, language='spa')
         for work in [fre, spa]:
             work.presentation_edition.series = series_name
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
 
         lane.languages = ['fre', 'spa']
@@ -565,6 +616,7 @@ class TestSeriesLane(LaneTest):
         series_name = "Monkey Business"
         for work in [children, adult, adults_only]:
             work.presentation_edition.series = series_name
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
 
         # SeriesLane only returns works that match a given audience.
@@ -585,6 +637,29 @@ class TestSeriesLane(LaneTest):
             self._default_library, series_name, audiences=[Classifier.AUDIENCE_ADULTS_ONLY]
         )
         self.assert_works_queries(adult_lane, [adults_only])
+
+    def test_facets_entry_point_propagated(self):
+        """The facets passed in to SeriesLane.featured_works are converted
+        to a FeaturedSeriesFacets object with the same entry point.
+        """
+        lane = SeriesLane(self._default_library, "A series")
+        def mock_works(_db, facets, pagination):
+            self.called_with = facets
+            # It doesn't matter what the query we return matches; just
+            # return some kind of query.
+            return _db.query(MaterializedWorkWithGenre)
+        lane.works = mock_works
+        entrypoint = object()
+        facets = FacetsWithEntryPoint(entrypoint=entrypoint)
+        lane.featured_works(self._db, facets=facets)
+
+        new_facets = self.called_with
+        assert isinstance(new_facets, FeaturedSeriesFacets)
+        eq_(entrypoint, new_facets.entrypoint)
+
+        # Availability facets have been hard-coded rather than propagated.
+        eq_(FeaturedSeriesFacets.COLLECTION_FULL, new_facets.collection)
+        eq_(FeaturedSeriesFacets.AVAILABLE_ALL, new_facets.availability)
 
 
 class TestContributorLane(LaneTest):
@@ -608,6 +683,7 @@ class TestContributorLane(LaneTest):
         w2 = self._work(title="X is for Xylophone", with_license_pool=True)
         same_name = w2.presentation_edition.contributions[0].contributor
         same_name.display_name = 'Lois Lane'
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
 
         # The work with a matching name is found in the contributor lane.
@@ -623,6 +699,7 @@ class TestContributorLane(LaneTest):
         w4 = self._work(title="D is for Dinosaur", with_license_pool=True)
         same_viaf, i = self._contributor('Lane, L', **dict(viaf='7'))
         w4.presentation_edition.add_contributor(same_viaf, [Contributor.EDITOR_ROLE])
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
 
         # Those works are also included in the lane, in alphabetical order.
@@ -635,6 +712,7 @@ class TestContributorLane(LaneTest):
         for work in [fre, spa]:
             main_contribution = work.presentation_edition.contributions[0]
             main_contribution.contributor = self.contributor
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
 
         lane = ContributorLane(self._default_library, 'Lois Lane', languages=['eng'])
@@ -650,6 +728,7 @@ class TestContributorLane(LaneTest):
         # Give them all the same contributor.
         for work in works:
             work.presentation_edition.contributions[0].contributor = self.contributor
+        self._db.commit()
         SessionManager.refresh_materialized_views(self._db)
 
         # Only childrens works are available in a ContributorLane with a
@@ -664,3 +743,178 @@ class TestContributorLane(LaneTest):
             self._default_library, 'Lois Lane', audiences=list(Classifier.AUDIENCES_JUVENILE)
         )
         self.assert_works_queries(ya_lane, [children, ya])
+
+class TestCrawlableFacets(DatabaseTest):
+
+    def test_default(self):
+        facets = CrawlableFacets.default(self._default_library)
+        eq_(CrawlableFacets.COLLECTION_FULL, facets.collection)
+        eq_(CrawlableFacets.AVAILABLE_ALL, facets.availability)
+        eq_(CrawlableFacets.ORDER_LAST_UPDATE, facets.order)
+        eq_(False, facets.order_ascending)
+        enabled_facets = facets.facets_enabled_at_init
+        # There's only one enabled facets for each facet group.
+        for group in enabled_facets.itervalues():
+            eq_(1, len(group))
+
+    def test_last_update_order_facet(self):
+        facets = CrawlableFacets.default(self._default_library)
+
+        w1 = self._work(with_license_pool=True)
+        w2 = self._work(with_license_pool=True)
+        now = datetime.datetime.utcnow()
+        w1.last_update_time = now - datetime.timedelta(days=4)
+        w2.last_update_time = now - datetime.timedelta(days=3)
+        self.add_to_materialized_view([w1, w2])
+
+        from core.model import MaterializedWorkWithGenre as work_model
+        qu = self._db.query(work_model)
+        qu = facets.apply(self._db, qu)
+        # w2 is first because it was updated more recently.
+        eq_([w2.id, w1.id], [mw.works_id for mw in qu])
+
+        list, ignore = self._customlist(num_entries=0)
+        e2, ignore = list.add_entry(w2)
+        e1, ignore = list.add_entry(w1)
+        self._db.flush()
+        SessionManager.refresh_materialized_views(self._db)
+        qu = self._db.query(work_model)
+        qu = facets.apply(self._db, qu)
+        # w1 is first because it was added to the list more recently.
+        eq_([w1.id, w2.id], [mw.works_id for mw in qu])
+
+    def test_order_by(self):
+        """Crawlable feeds are always ordered by time updated and then by 
+        collection ID and work ID.
+        """
+        from core.model import MaterializedWorkWithGenre as mw
+        order_by, distinct = CrawlableFacets.order_by()
+
+        updated, collection_id, works_id = distinct
+        expect_func = 'greatest(mv_works_for_lanes.availability_time, mv_works_for_lanes.first_appearance, mv_works_for_lanes.last_update_time)'
+        eq_(expect_func, str(updated))
+        eq_(mw.collection_id, collection_id)
+        eq_(mw.works_id, works_id)
+
+        updated_desc, collection_id, works_id = order_by
+        eq_(expect_func + ' DESC', str(updated_desc))
+        eq_(mw.collection_id, collection_id)
+        eq_(mw.works_id, works_id)
+
+
+class TestCrawlableCustomListBasedLane(DatabaseTest):
+
+    def test_initialize(self):
+        list, ignore = self._customlist()
+        lane = CrawlableCustomListBasedLane()
+        lane.initialize(self._default_library, list)
+        eq_(self._default_library.id, lane.library_id)
+        eq_([list], lane.customlists)
+        eq_("Crawlable feed: %s" % list.name, lane.display_name)
+        eq_(None, lane.audiences)
+        eq_(None, lane.languages)
+        eq_(None, lane.media)
+        eq_([], lane.children)
+
+    def test_bibliographic_filter_clause(self):
+        w1 = self._work(with_license_pool=True)
+        w2 = self._work(with_license_pool=True)
+
+        # Only w2 is in the list.
+        list, ignore = self._customlist(num_entries=0)
+        e2, ignore = list.add_entry(w2)
+        self.add_to_materialized_view([w1, w2])
+        self._db.flush()
+        SessionManager.refresh_materialized_views(self._db)
+
+        lane = CrawlableCustomListBasedLane()
+        lane.initialize(self._default_library, list)
+
+        from core.model import MaterializedWorkWithGenre as work_model
+        qu = self._db.query(work_model)
+        qu, clause = lane.bibliographic_filter_clause(self._db, qu)
+
+        qu = qu.filter(clause)
+
+        eq_([w2.id], [mw.works_id for mw in qu])
+
+    def test_url_arguments(self):
+        list, ignore = self._customlist()
+        lane = CrawlableCustomListBasedLane()
+        lane.initialize(self._default_library, list)
+        route, kwargs = lane.url_arguments
+        eq_(CrawlableCustomListBasedLane.ROUTE, route)
+        eq_(list.name, kwargs.get("list_name"))
+        
+
+class TestCrawlableCollectionBasedLane(DatabaseTest):
+
+    def test_init(self):
+
+        library = self._default_library
+        default_collection = self._default_collection
+        other_collection = self._collection()
+        other_collection_2 = self._collection()
+
+        # A lane for all the collections associated with a library.
+        lane = CrawlableCollectionBasedLane(library)
+        eq_("Crawlable feed: %s" % library.name, lane.display_name)
+        eq_([x.id for x in library.collections], lane.collection_ids)
+
+        # A lane for a collection not actually associated with a
+        # library.
+        lane = CrawlableCollectionBasedLane(
+            None, [other_collection, other_collection_2]
+        )
+        eq_(
+            "Crawlable feed: %s / %s" % tuple(
+                sorted([other_collection.name, other_collection_2.name])
+            ),
+            lane.display_name
+        )
+        eq_(set([other_collection.id, other_collection_2.id]),
+            set(lane.collection_ids))
+        eq_(None, lane.get_library(self._db))
+
+    def test_bibliographic_filter_clause(self):
+        # Normally, if collection_ids is empty it means there are no
+        # restrictions on collection. However, in this case if
+        # collections_id is empty it means no titles should be
+        # returned.
+        collection = self._default_collection
+        self._default_library.collections = []
+        lane = CrawlableCollectionBasedLane(self._default_library)
+        eq_([], lane.collection_ids)
+
+        # This is managed by having bibliographic_filter_clause return None
+        # to short-circuit a query in progress.
+        eq_((None, None), lane.bibliographic_filter_clause(object(), object()))
+
+        # If collection_ids is not empty, then
+        # bibliographic_filter_clause passed through the query it's
+        # given without changing it.
+        lane.collection_ids = [self._default_collection.id]
+        qu = self._db.query(MaterializedWorkWithGenre)
+        qu2, clause = lane.bibliographic_filter_clause(self._db, qu)
+        eq_(qu, qu2)
+        eq_(None, clause)
+
+    def test_url_arguments(self):
+        library = self._default_library
+        other_collection = self._collection()
+
+        # A lane for all the collections associated with a library.
+        lane = CrawlableCollectionBasedLane(library)
+        route, kwargs = lane.url_arguments
+        eq_(CrawlableCollectionBasedLane.LIBRARY_ROUTE, route)
+        eq_(None, kwargs.get("collection_name"))
+
+        # A lane for a collection not actually associated with a
+        # library. (A Library is still necessary to provide a point of
+        # reference for classes like Facets and CachedFeed.)
+        lane = CrawlableCollectionBasedLane(
+            library, [other_collection]
+        )
+        route, kwargs = lane.url_arguments
+        eq_(CrawlableCollectionBasedLane.COLLECTION_ROUTE, route)
+        eq_(other_collection.name, kwargs.get("collection_name"))
